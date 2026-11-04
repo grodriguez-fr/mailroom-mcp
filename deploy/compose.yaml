@@ -1,0 +1,52 @@
+# Remote (HTTP) deployment. Values come from a .env file next to this one (see .env.example
+# and docs/deployment.md). Secrets and OAuth state live next to it too, in secrets/ and oauth-data/.
+# The port is bound to localhost only: put a TLS reverse proxy or a tunnel in front of it.
+services:
+  mailroom-mcp:
+    build: ..
+    image: ${MAIL_IMAGE:-mailroom-mcp:latest}
+    container_name: mailroom-mcp
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 384m
+    cpus: 0.50
+    pids_limit: 128
+    environment:
+      # One mailbox (MAIL_IMAP_HOST, MAIL_USER) or several (MAIL_ACCOUNTS_FILE): the server refuses to start
+      # without either.
+      MAIL_IMAP_HOST: ${MAIL_IMAP_HOST:-}
+      MAIL_IMAP_PORT: ${MAIL_IMAP_PORT:-993}
+      MAIL_USER: ${MAIL_USER:-}
+      MAIL_ALIASES: ${MAIL_ALIASES:-}
+      # Sending (send_draft), off unless enabled: MAIL_SEND_ENABLED, or "send": true per account in the accounts file.
+      MAIL_SEND_ENABLED: ${MAIL_SEND_ENABLED:-}
+      MAIL_SMTP_HOST: ${MAIL_SMTP_HOST:-}
+      MAIL_SMTP_PORT: ${MAIL_SMTP_PORT:-}
+      MAIL_SMTP_SECURITY: ${MAIL_SMTP_SECURITY:-}
+      MAIL_SEND_LIMIT_PER_HOUR: ${MAIL_SEND_LIMIT_PER_HOUR:-}
+      MAIL_ACCOUNTS_FILE: ${MAIL_ACCOUNTS_FILE:-}
+      MAIL_TIMEZONE: ${MAIL_TIMEZONE:-UTC}
+      MAIL_PUBLIC_URL: ${MAIL_PUBLIC_URL:?Set MAIL_PUBLIC_URL}
+      MAIL_GOOGLE_CLIENT_ID: ${MAIL_GOOGLE_CLIENT_ID:?Set MAIL_GOOGLE_CLIENT_ID}
+      MAIL_GOOGLE_SUB: ${MAIL_GOOGLE_SUB:?Set MAIL_GOOGLE_SUB}
+      MAIL_GOOGLE_CLIENT_SECRET_FILE: /run/secrets/google-client-secret
+      MAIL_PASSWORD_FILE: /run/secrets/mail-password
+      FASTMCP_HOME: /data
+    volumes:
+      - ./secrets:/run/secrets:ro
+      - ./oauth-data:/data
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: local
+      options: {max-size: 5m, max-file: '2'}

@@ -1,0 +1,22 @@
+.deploy-secrets/
+secrets/
+oauth-data/
+.env
+__pycache__/
+.pytest_cache/
+compose.override.yaml
+*.local.md
+.venv/
+.ruff_cache/
+*.egg-info/
+dist/
+
+# Local credentials and exports (keep the deployment template).
+.env.*
+!.env.example
+*.token
+*.password
+*.pem
+*.key
+accounts.json
+*.bundle

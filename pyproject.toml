@@ -1,0 +1,42 @@
+[project]
+name = "mailroom-mcp"
+version = "0.1.0"
+description = "Self-hosted MCP server giving AI assistants careful access to your mailboxes"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Guillaume Rodriguez" }]
+requires-python = ">=3.11"
+dependencies = ["fastmcp==4.1.3", "tzdata"]
+keywords = ["mcp", "imap", "email", "llm", "claude", "chatgpt"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Email",
+]
+
+[project.urls]
+Repository = "https://github.com/grodriguez-fr/mailroom-mcp"
+
+[project.scripts]
+mailroom-mcp = "mailroom_mcp.server:main"
+mailroom-mcp-http = "mailroom_mcp.remote:main"
+mailroom-mcp-auth = "mailroom_mcp.auth:main"
+
+[dependency-groups]
+dev = ["pytest", "ruff"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+ignore = ["E731"]
