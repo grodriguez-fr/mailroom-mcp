@@ -39,7 +39,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.exceptions import ValidationError as ArgumentsError
 from fastmcp.server.elicitation import AcceptedElicitation, CancelledElicitation, DeclinedElicitation
 from fastmcp.server.middleware import Middleware
-from fastmcp.tools import Tool, ToolResult
+from fastmcp.tools import FunctionTool, ToolResult
 from mcp.types import ToolAnnotations
 from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import Field
@@ -3086,7 +3086,8 @@ TOOL_ANNOTATIONS = {
     "read_message": _READ,
     "move_messages": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
     "set_flags": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
-    "create_folder": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+    # A second call changes nothing ("already exists: nothing was created").
+    "create_folder": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
     "save_draft": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
     "send_draft": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
 }
@@ -3231,6 +3232,17 @@ class TextOnly(Middleware):
         return ToolResult(content=result.content, meta=result.meta)
 
 
+class LeanTool(FunctionTool):
+    """Published without FastMCP's own `_meta.fastmcp` (`{"tags": []}` on every tool, read by no client): about
+    30 characters per tool in every tools/list. Any other `_meta` (securitySchemes over HTTP) stays."""
+
+    def to_mcp_tool(self, **overrides):
+        tool = super().to_mcp_tool(**overrides)
+        meta = {k: v for k, v in (tool.meta or {}).items() if not (k == "fastmcp" and v == {"tags": []})}
+        tool.meta = meta or None
+        return tool
+
+
 def compact_schema(schema: dict) -> dict:
     """Shorter published schema: an optional `X | None = None` parameter is advertised as X, without
     `anyOf` or `default: null` (validation still accepts null); the validated schema is unchanged."""
@@ -3258,7 +3270,7 @@ def build(server: FastMCP, *, meta: dict | None = None) -> FastMCP:
         options = {"name": name, "annotations": ToolAnnotations(**hints)}
         if meta:
             options["meta"] = meta
-        tool = Tool.from_function(fn, output_schema=None, **options)
+        tool = LeanTool.from_function(fn, output_schema=None, **options)
         tool.parameters = compact_schema(tool.parameters)
         server.add_tool(tool)
         accepted[name] = [p for p, v in inspect.signature(fn).parameters.items() if "Context" not in str(v.annotation)]

@@ -25,7 +25,7 @@ EXPECTED_ANNOTATIONS = {
     "read_message": {"readOnlyHint": True, "openWorldHint": True},
     "move_messages": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
     "set_flags": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
-    "create_folder": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+    "create_folder": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
     "save_draft": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
     "send_draft": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
 }
@@ -119,6 +119,7 @@ def test_stdio_surface():
     tools = stdio_tools()
     check_surface(tools)
     assert all("outputSchema" not in t for t in tools.values())  # answers are text only
+    assert all("_meta" not in t for t in tools.values())  # no empty FastMCP tags on every tool
     assert tools["search_messages"]["inputSchema"]["properties"]["limit"]["maximum"] == server.LIMIT_MAX
     properties = tools["search_messages"]["inputSchema"]["properties"]
     assert properties["group_by"]["enum"] == ["sender", "folder"]
@@ -135,6 +136,7 @@ def test_http_surface_matches_stdio(http):
     for name, tool in tools.items():
         assert tool["inputSchema"] == stdio[name]["inputSchema"] and tool["description"] == stdio[name]["description"]
         assert tool["_meta"]["securitySchemes"][0]["type"] == "oauth2"
+        assert set(tool["_meta"]) == {"securitySchemes"}, name
         assert "outputSchema" not in tool, name
 
 
