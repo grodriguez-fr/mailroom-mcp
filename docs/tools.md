@@ -197,11 +197,15 @@ It comes with every page of a long text, so ask for it once.
   authenticated nor failed, and no result of its headers is trusted, whatever `security.headers` shows). The receiving
   server is the host named by `by` in the topmost `Received` line (nobody can write above it) or an `auth_servers`
   entry. A result counts when its authserv-id is that server or on its organisational domain, and it sits above the
-  first `Received` line that another server wrote. `ARC-Authentication-Results` is never used: its seal cannot be
-  checked without cryptography and DNS lookups, which the server does not do. The signatures are not checked either, so a
-  host that writes no `Authentication-Results` gives `unknown` (a sender that guesses the receiving host's name and
-  talks to it directly can still write a line that looks like its own: the check narrows what a sender can claim, it does
-  not replace a verified DKIM).
+  *entry line*: the lowest of the consecutive `Received` lines the receiver wrote, from the top (`by` is the receiver,
+  or a bare token above its first host line), where it accepted the message from outside. Everything under that line
+  was written by the sender and is never trusted, whatever its authserv-id says, so a sender that connects straight
+  to a shared host cannot add a line that looks like its own. Without a `Received` line of the receiver nothing counts.
+  For the `auth_servers` only (Gmail writes its results right under its own `Received` line), a result between the entry
+  line and the next `Received` line counts too. `ARC-Authentication-Results` is never used: its seal cannot be checked
+  without cryptography and DNS lookups, which the server does not do. The signatures are not checked either, so a
+  host that writes no `Authentication-Results` gives `unknown`: the check narrows what a sender can claim, it does
+  not replace a verified DKIM.
 - `security.phishing`: `{score, level, reasons}`, a hint to look closer, never a verdict, computed without network
   access from the whole evidence (before any size cut). `score` is 0-100 (the sum of the weights, capped), `level` is
   `low` (< 30), `medium` (30-59) or `high` (>= 60), `reasons` is `[{code, detail, weight}]` by decreasing weight, the

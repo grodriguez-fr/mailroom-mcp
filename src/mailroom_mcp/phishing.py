@@ -528,57 +528,61 @@ def trusted_results(headers: dict, servers: tuple[str, ...] = ()) -> dict[str, s
     no such line. Everything else is text the sender wrote: any sender can add `Authentication-Results: x; dkim=pass`.
 
     The receiving server is the host in the `by` of the topmost Received line (nobody can add a line above it) and the
-    configured `servers` (authserv-ids; mx.google.com for Gmail, whose topmost line only names an internal token). An
+    configured `servers` (authserv-ids; mx.google.com for Gmail, whose topmost lines only name an internal token). An
     Authentication-Results counts when its authserv-id is that server or on its organisational domain; a Received-SPF
-    when the host named in its comment is, or when it names none. Both must sit above the first Received line
-    that another server wrote: the first one, from the top, whose `by` is a host other than the receiver's (an
-    internal hand-over below the receiver's own line, or a bare token under it, is not the receiver's either). The
-    topmost line that qualifies is used. ARC-Authentication-Results is never used: its seal cannot be checked
-    without cryptography and DNS, which this module does not do. Without such a line the authentication is unknown."""
+    when the host named in its comment is, or when it names none. Both must sit above the entry line: the lowest of the
+    consecutive Received lines the receiver wrote, from the top (`by` is the receiver, or a bare token above the
+    first such host line), the one where it accepted the message from outside. Everything under it comes from the
+    sender and is never trusted, whatever its authserv-id says: on a shared host every Received line is the receiver's,
+    and the sender can still write a header under them all. One exception, for the configured `servers` only (Gmail
+    writes its results right under its own Received line, before the sender's): their results are also accepted
+    between the entry line and the next Received line, where the real ones sit above any forged one. Without a
+    Received line of the receiver nothing is trusted, and neither without header positions. The topmost line that qualifies is used. ARC-Authentication-Results is never
+    used: its seal cannot be checked without cryptography and DNS, which this module does not do. Without such a line
+    the authentication is unknown."""
     received = _all(headers, "Received")
     ids = {s.lower().rstrip(".") for s in servers}
     top = _by(received[0]) if received else ""
     if _is_host(top):
         ids.add(top)
+    ids_configured = {i for i in ids if _is_host(i) and i != top}
+    ids = {i for i in ids if _is_host(i)}
     if not ids:
         return {"ar": "", "spf": ""}
-    ids = {i for i in ids if _is_host(i)}
 
     def receiver(host: str) -> bool:
         return any(_same_server(host, i) for i in ids)
 
-    bys, boundary, seen = [_by(line) for line in received], None, False
-    for index, by in enumerate(bys):
-        if _is_host(by):
-            if not receiver(by):
-                boundary = index
-                break
-            seen = True
-        elif seen:
-            boundary = index
-            break
+    def configured(host: str) -> bool:
+        return any(_same_server(host, i) for i in ids_configured)
 
+    entry = None   # index of the lowest Received line of the receiver in the run that starts at the top
+    for index, by in enumerate(_by(line) for line in received):
+        if _is_host(by) and receiver(by):
+            entry = index
+        elif entry is not None or _is_host(by):
+            break   # another server's line, or a bare token under the receiver's own: the sender's side starts here
     order = headers.get("_Order")
 
-    def above(name: str, index: int) -> bool:
-        """Is the `index`-th line of that header above the first Received line another server wrote?"""
-        if boundary is None:
-            return True
-        if not isinstance(order, list):
-            return False   # no positions: cannot tell
+    def above(name: str, index: int, slack: int = 0) -> bool:
+        """Is the `index`-th line of that header above the entry line (`slack`: or that many Received lines under it)?"""
+        if entry is None or not isinstance(order, list):
+            return False   # no line of the receiver, or no positions: cannot tell
         nth = [i for i, h in enumerate(order) if h == name.lower()]
         if index >= len(nth):
             return False
-        return sum(1 for h in order[:nth[index]] if h == "received") <= boundary
+        return sum(1 for h in order[:nth[index]] if h == "received") <= entry + slack
 
     out = {"ar": "", "spf": ""}
     for index, value in enumerate(_all(headers, "Authentication-Results")):
-        if receiver(_authserv_id(value)) and above("Authentication-Results", index):
+        host = _authserv_id(value)
+        if receiver(host) and above("Authentication-Results", index, configured(host)):
             out["ar"] = value
             break
     for index, value in enumerate(_all(headers, "Received-SPF")):
         named = re.search(r"\(\s*([^\s():]+)\s*:", value)
-        if (not named or receiver(named.group(1).lower())) and above("Received-SPF", index):
+        host = named.group(1).lower() if named else ""
+        if (not named or receiver(host)) and above("Received-SPF", index, bool(named) and configured(host)):
             out["spf"] = value
             break
     return out
