@@ -27,9 +27,11 @@ ATTACHMENT_STRUCTURE = (
 
 def mk(uid, subject, sender="Alice <alice@example.org>", date="Tue, 20 Oct 2026 10:00:00 +0000", body="Bonjour",
        flags=(), internal=None, attachment=False, structure=None, to="me@example.org", html=None,
-       message_id=None):
+       message_id=None, headers=()):
     msg = EmailMessage()
     msg["From"], msg["To"], msg["Subject"] = sender, to, subject
+    for name, value in headers:  # extra headers, in order; a name may repeat (Received)
+        msg[name] = value
     if date:
         msg["Date"] = date
     if message_id:

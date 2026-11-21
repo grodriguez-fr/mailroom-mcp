@@ -45,7 +45,7 @@ from mcp_types.version import MODERN_PROTOCOL_VERSIONS
 from pydantic import Field
 from pydantic import ValidationError as PydanticValidationError
 
-from mailroom_mcp import google_oauth, smtp
+from mailroom_mcp import google_oauth, phishing, smtp
 from mailroom_mcp.config import (  # noqa: F401  (settings, ConfigError: public names used by remote.py and tests)
     DEFAULT_ACCOUNT,
     DEFAULT_TIMEZONE,
@@ -2225,20 +2225,27 @@ def decode_part(raw: bytes, part) -> str:
 
 
 def read_full(M, uid: int):
-    """Fallback when the structure is unreadable: the whole message."""
+    """Fallback when the structure is unreadable: the whole message. (body, attachments, inline images, HTML
+    source or None)."""
     items = parse_fetch(ok(M.uid("FETCH", str(uid), "(UID BODY.PEEK[])"), "Fetch"))
     if not items:
         return None
     msg = email.message_from_bytes(items[0][1], policy=policy.default)
-    body = ""
+    body, markup = "", None
     part = msg.get_body(preferencelist=("plain", "html"))
-    if part is not None:
+
+    def content(node) -> str:
         try:
-            body = part.get_content()
+            return node.get_content()
         except Exception:
-            body = (part.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
+            return (node.get_payload(decode=True) or b"").decode("utf-8", errors="replace")
+
+    if part is not None:
+        body = content(part)
         if part.get_content_type() == "text/html":
-            body = html_to_text(body)
+            markup, body = body, html_to_text(body)
+    if markup is None and (page := msg.get_body(preferencelist=("html",))) is not None:
+        markup = content(page)
     attachments, inline = [], 0
 
     def walk(node, parent=None):
@@ -2259,7 +2266,47 @@ def read_full(M, uid: int):
                                 "size": len(payload or b"")})
 
     walk(msg)
-    return body, attachments, inline
+    return body, attachments, inline, markup
+
+
+def fetch_text(M, uid: int, part, folder: str, hint: str, warnings: list) -> str:
+    """Decoded text of one text part (the start only beyond TEXT_FETCH_MAX bytes, with a warning)."""
+    spec = f"BODY.PEEK[{part['section']}]"
+    partial = part["size"] > TEXT_FETCH_MAX
+    if partial:
+        spec += f"<0.{TEXT_FETCH_MAX}>"
+        warnings.append(f"Very long text ({count_text(part['size'])} bytes): only the first "
+                        f"{count_text(TEXT_FETCH_MAX)} bytes are read.")
+    data = ok(M.uid("FETCH", str(int(uid)), f"(UID {spec})"), "Fetch text")
+    fetched = [i for i in fetch_items(data) if item_uid(i) == uid]
+    raw = body_section(fetched[0]) if fetched else None
+    if raw is None and fetched:  # section missing from the response: empty text rather than an error
+        raw = b""
+    if raw is None:
+        raise not_found(uid, folder, hint)
+    if partial and part["encoding"] == "base64":  # start only: complete groups of 4 characters
+        raw = re.sub(rb"\s", b"", raw)
+        raw = raw[:len(raw) // 4 * 4]
+    return decode_part(raw, part)
+
+
+def security_report(msg, markup: str | None, warnings: list) -> dict:
+    """read_message(security=true): authentication headers and link targets. Links whose text shows another
+    domain come first; what does not fit the size budget is dropped and said in `capped`."""
+    headers, cut = phishing.auth_headers(msg)
+    report = {"headers": headers}
+    if markup is None:
+        report["links"] = []
+        warnings.append("No HTML part: no link targets to check (a plain text link is not listed).")
+    else:
+        links = sorted(phishing.extract_links(markup), key=lambda link: not link.get("mismatch"))
+        report["links"] = fit(links, max(RESPONSE_BUDGET - json_size(headers), 0)) if links else []
+        if len(report["links"]) < len(links):
+            cut.append(f"links {len(report['links'])}/{len(links)}")
+    if cut:
+        report["capped"] = {"reason": "size", "resumable": False, "cut": cut}
+        warnings.append("Security data was shortened to fit the size budget: see security.capped.")
+    return report
 
 
 def read_message(
@@ -2268,9 +2315,10 @@ def read_message(
     offset: Annotated[int, Field(ge=0, description="next_offset of the previous page.")] = 0,
     max_chars: Annotated[int, Field(ge=1, le=MAX_CHARS_LIMIT)] = MAX_CHARS_DEFAULT,
     strip_quotes: Annotated[bool, Field(description="Removes quoted thread and disclaimers.")] = True,
+    security: Annotated[bool, Field(description="Adds authentication headers and real link targets (phishing check).")] = False,
     account: AccountName = None,
 ) -> dict:
-    """Reads a mail without marking it read: headers, text without the quoted thread (strip_quotes), attachments (inline images only counted). A uid is only valid in the folder it came from: pass the account, folder and uid of a search row together. Long text: call again with offset=next_offset (same strip_quotes): a position in the cleaned text (pages end on a paragraph, quotes removed), not in the raw mail, so it can be below max_chars; null: the end. Example: {"folder":"INBOX","uid":4512}"""
+    """Reads a mail without marking it read: headers, text without the quoted thread (strip_quotes), attachments (inline images only counted). security:true adds authentication headers and link domains (mismatch: text shows another), never opened. A uid is only valid in the folder it came from: pass the account, folder and uid of a search row together. Long text: call again with offset=next_offset (same strip_quotes): a position in the cleaned text (pages end on a paragraph, quotes removed), not in the raw mail, so it can be below max_chars; null: the end. Example: {"folder":"INBOX","uid":4512}"""
     _int_arg(uid, "uid", 1)
     _int_arg(offset, "offset", 0)
     _int_arg(max_chars, "max_chars", 1, MAX_CHARS_LIMIT)
@@ -2291,34 +2339,21 @@ def read_message(
         item = items[0]
         tree = item_structure(item)
         root = mime_tree(tree)
+        markup = None
         if root is None:
             full = read_full(M, uid)
             if full is None:
                 raise not_found(uid, name, hint)
-            body, attachments, inline = full
+            body, attachments, inline, markup = full
         else:
             part = find_body(root)
             body = ""
             if part is not None:
-                spec = f"BODY.PEEK[{part['section']}]"
-                partial = part["size"] > TEXT_FETCH_MAX
-                if partial:
-                    spec += f"<0.{TEXT_FETCH_MAX}>"
-                    warnings.append(f"Very long text ({count_text(part['size'])} bytes): only the first "
-                                    f"{count_text(TEXT_FETCH_MAX)} bytes are read.")
-                data = ok(M.uid("FETCH", str(int(uid)), f"(UID {spec})"), "Fetch text")
-                fetched = [i for i in fetch_items(data) if item_uid(i) == uid]
-                raw = body_section(fetched[0]) if fetched else None
-                if raw is None and fetched:  # section missing from the response: empty text rather than an error
-                    raw = b""
-                if raw is None:
-                    raise not_found(uid, name, hint)
-                if partial and part["encoding"] == "base64":  # start only: complete groups of 4 characters
-                    raw = re.sub(rb"\s", b"", raw)
-                    raw = raw[:len(raw) // 4 * 4]
-                body = decode_part(raw, part)
+                body = fetch_text(M, uid, part, name, hint, warnings)
                 if part["subtype"] == "html":
-                    body = html_to_text(body)
+                    markup, body = body, html_to_text(body)
+            if security and markup is None and (html_part := find_body(root, ("html",))) is not None:
+                markup = fetch_text(M, uid, html_part, name, hint, warnings)
             attachments, inline = attachment_list(root, part)
     m = item["text"]
     flags = (re.search(r"FLAGS \(([^)]*)\)", m) or [None, ""])[1].split()
@@ -2353,6 +2388,8 @@ def read_message(
     out.update({"body": chunk, "body_chars": len(body), "next_offset": next_offset, "attachments": attachments})
     if inline:
         out["inline_images"] = inline
+    if security:
+        out["security"] = security_report(msg, markup, warnings)
     if late:
         warnings.append(late)
     if warnings:

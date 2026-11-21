@@ -7,13 +7,15 @@ remote deployment: [docs/deployment.md](docs/deployment.md).
 - `src/mailroom_mcp/server.py`: tools and stdio transport (`mailroom-mcp`). `build()` registers the tools once
   for both transports.
 - `src/mailroom_mcp/remote.py`: HTTP transport, OAuth restricted to one Google account (`mailroom-mcp-http`).
+- `src/mailroom_mcp/phishing.py`: `read_message(security=true)`: authentication headers and link targets (pure text
+  functions: never any network access).
 - `src/mailroom_mcp/config.py`: environment and accounts file (`MAIL_ACCOUNTS_FILE`), strict validation.
 - `src/mailroom_mcp/smtp.py`: SMTP submission for `send_draft`; every failure says whether the mail left.
 - `src/mailroom_mcp/google_oauth.py`: Gmail XOAUTH2 (refresh token exchange, in-memory access tokens);
   `src/mailroom_mcp/auth.py`: `mailroom-mcp-auth google`, the loopback authorization flow.
 - `tests/`: `test_server.py` (fake IMAP), `test_accounts.py` (several accounts, Gmail-like fake, XOAUTH2),
   `test_config.py`, `test_auth.py`, `test_remote.py` (HTTP and OAuth), `test_contract.py` (both transports),
-  `test_send.py` (`send_draft`, fake SMTP server).
+  `test_send.py` (`send_draft`, fake SMTP server), `test_phishing.py` (`read_message` security check).
 - `deploy/`: Docker Compose file and `.env.example`; `Dockerfile` at the root installs from `uv.lock`.
 
 ## Commands

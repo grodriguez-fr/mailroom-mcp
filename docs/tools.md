@@ -183,6 +183,27 @@ the cleaned text, `next_offset` the position in that text where the next page st
 at the end). It counts characters of the cleaned text, not of the raw message, and pages end on a paragraph:
 it can be below `max_chars` while more text follows.
 
+`security` (default false, so ordinary reads stay light) adds a `security` object to check a mail for phishing in
+the same call, from the headers already fetched and, for links, the HTML part (downloaded only then, when the text
+part was chosen for the body). Nothing is fetched from the network: a link is never opened, resolved or followed.
+It comes with every page of a long text, so ask for it once.
+
+- `security.headers`: `From`, `Reply-To`, `Return-Path`, `Sender`, `Received` (always a list: every line, in message
+  order, the receiving server's first), `Authentication-Results`, `ARC-Authentication-Results`, `Received-SPF`,
+  `Message-ID`, `List-Unsubscribe`; absent ones are left out, a repeated one is a list. `DKIM-Signature` is a list of
+  `{d, s}` (signing domain and selector): the signature itself is never returned. Authentication-Results lines
+  other than the one your own server added are written by the sender: only the topmost is evidence.
+- `security.links`: the `<a href>` of the HTML body, deduplicated on URL and displayed text (`count` when repeated):
+  `{url, domain?, text?, count?, mismatch?, shown?, idn?, scheme?}`. `domain` is the real host of an `http(s)` URL,
+  lowercase; `mailto:`, `javascript:` and other schemes carry `scheme` and no domain. `mismatch: true` means the
+  text displays a URL or domain that is not the destination's or one of its parents or subdomains, and `shown` is
+  that domain ("www.paypal.com" pointing to `evil.example`). `idn: true` marks a host written with non-ASCII or
+  `xn--` labels (look-alike characters). Flagged links come first. Links without target (`#…`, empty) and relative
+  links are left out; links of a mail without HTML part are not listed (a warning says so).
+- Size: a value is cut at 400 characters (`…`), `Received` at 20 lines, a URL at 300 characters (its `domain` stays
+  complete), and links at the size budget of a list page. Anything cut is named in `security.capped`
+  `{reason: "size", resumable: false, cut: ["Received 20/27", "links 31/80"]}`, with a warning.
+
 ## Sorting and drafts
 
 - `move_messages`: `{folder, destination, moved, not_found, warnings?}`. UIDs are checked in the source folder
