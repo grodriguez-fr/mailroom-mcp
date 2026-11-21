@@ -38,3 +38,6 @@ MAIL_IMAP_HOST=… MAIL_USER=… uv run mailroom-mcp --check   # real login, lis
 - Compact output: every field costs context to every model using the server. Readable error messages.
 - Changing an output shape forces clients to reload the schema: say so in the change description.
 - Dependencies change through `pyproject.toml` and `uv lock`, never by hand in `uv.lock`.
+- The security check stays offline: no DKIM signature check, no ARC seal check, no DNS lookup, no link fetch. It
+  trusts only the receiving server's own `Authentication-Results` (decided after real-mail validation; reopen only
+  with mail it misses).

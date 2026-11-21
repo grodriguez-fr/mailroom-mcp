@@ -203,9 +203,9 @@ It comes with every page of a long text, so ask for it once.
   to a shared host cannot add a line that looks like its own. Without a `Received` line of the receiver nothing counts.
   For the `auth_servers` only (Gmail writes its results right under its own `Received` line), a result between the entry
   line and the next `Received` line counts too. `ARC-Authentication-Results` is never used: its seal cannot be checked
-  without cryptography and DNS lookups, which the server does not do. The signatures are not checked either, so a
-  host that writes no `Authentication-Results` gives `unknown`: the check narrows what a sender can claim, it does
-  not replace a verified DKIM.
+  without cryptography and DNS lookups, which the server does not do. The signatures are not checked either (a
+  deliberate choice: the check stays offline), so a host that writes no `Authentication-Results` gives `unknown`: the
+  check narrows what a sender can claim, it does not replace a verified DKIM.
 - `security.phishing`: `{score, level, reasons}`, a hint to look closer, never a verdict, computed without network
   access from the whole evidence (before any size cut). `score` is 0-100 (the sum of the weights, capped), `level` is
   `low` (< 30), `medium` (30-59) or `high` (>= 60), `reasons` is `[{code, detail, weight}]` by decreasing weight, the
