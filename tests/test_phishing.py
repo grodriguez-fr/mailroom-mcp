@@ -248,8 +248,8 @@ def parcel(headers=PARCEL_HEADERS, html=PARCEL_HTML, body=PARCEL_TEXT, uid=1):
 
 def test_the_real_parcel_scam_scores_high(monkeypatch):
     result = score_of(monkeypatch, parcel())
-    assert result["level"] == "high" and result["score"] == 95
-    assert codes(result) == {"lookalike_domain": 35, "origin_mismatch": 25, "template_placeholder": 20, "link_domain_mismatch": 15}
+    assert result["level"] == "high" and result["score"] == 100  # 105 before the cap
+    assert codes(result) == {"lookalike_domain": 35, "origin_mismatch": 35, "template_placeholder": 20, "link_domain_mismatch": 15}
     assert [r["weight"] for r in result["reasons"]] == sorted((r["weight"] for r in result["reasons"]), reverse=True)
     details = " | ".join(r["detail"] for r in result["reasons"])
     assert "ml-colis-relay.example" in details and "helo is 'localhost'" in details and "203.0.113.64" in details
@@ -260,8 +260,8 @@ def test_newsletter_through_a_mailing_platform_stays_low(monkeypatch):
     m = mk(2, "Soldes", sender="Marque <newsletter@marque.fr>", body="Soldes: dernières heures. www.marque.fr", html=NEWSLETTER_HTML,
            headers=NEWSLETTER_HEADERS)
     result = score_of(monkeypatch, m, 2)
-    assert result["level"] == "low" and result["score"] == 15
-    assert codes(result) == {"display_mismatch": 10, "link_domain_mismatch": 5}
+    assert result["level"] == "low" and result["score"] == 10  # the From domain signed it: both weak signals capped at 5
+    assert codes(result) == {"display_mismatch": 5, "link_domain_mismatch": 5}
 
 
 def test_personal_mail_without_link_scores_zero(monkeypatch):
@@ -278,6 +278,148 @@ def test_plausible_medium_case(monkeypatch):
     result = score_of(monkeypatch, m, 4)
     assert result["level"] == "medium" and 30 <= result["score"] < 60
     assert {"link_domain_mismatch", "origin_mismatch", "urgency_payment", "spam_flag"} <= set(codes(result))
+
+
+# Fixtures for the tuning against real false positives: every host is fictional (.example), the brands are made up.
+def aligned_auth(domain):
+    return [("Authentication-Results", f"mx.example.org; spf=pass; dkim=pass header.d={domain}; dmarc=pass header.from={domain}"),
+            ("DKIM-Signature", f"v=1; a=rsa-sha256; d={domain}; s=k1; h=from:to:subject; bh=Zm9v; b=QUFB")]
+
+
+OK_HOP = ("Received", "from out.sender-hub.example (out.sender-hub.example [198.51.100.30]) by mx.example.org with ESMTPS; "
+                      "Fri, 21 Nov 2026 07:00:00 +0100")
+LOCALHOST_HOP = ("Received", "from [203.0.113.77] (port=51234 helo=localhost) by host.hosting.example with esmtp (Exim 4.100.1) "
+                             "id 1vMxyz-000abc-2Z; Fri, 21 Nov 2026 07:00:00 +0100")
+
+
+def level_of(monkeypatch, sender, html, headers, subject="Hello", body="Hello", uid=1):
+    return score_of(monkeypatch, mk(uid, subject, sender=sender, body=body, html=html, headers=headers), uid)
+
+
+def test_fake_crypto_wallet_notice_scores_high(monkeypatch):
+    html = ('<p>You have 13 (0.025 ETH) pending in your Wallet.</p>'
+            '<a href="https://wallet-notif.example/accept?id=7">Review Transaction &amp; Accept</a>')
+    result = level_of(monkeypatch, "Cryptovault <notif@cryptovault.example>", html, [LOCALHOST_HOP],
+                      subject="Action Required: 13 (0.025 ETH) pending in your Wallet",
+                      body="You have 13 (0.025 ETH) pending in your Wallet. Review Transaction & Accept")
+    assert result["level"] == "high" and result["score"] >= 60
+    assert {"origin_mismatch", "crypto_transaction_lure", "link_domain_mismatch"} <= set(codes(result))
+    assert codes(result)["origin_mismatch"] == 35 and codes(result)["crypto_transaction_lure"] == 20
+
+
+def test_improvised_first_hop_counts_whatever_the_from_looks_like():
+    headers = {"From": "Camille <camille@example.org>", "Received": ["from mx by me", LOCALHOST_HOP[1]]}
+    assert codes(phishing.phishing_score(headers, [], "")) == {"origin_mismatch": 35}
+
+
+def test_notification_sent_through_intercom_stays_low(monkeypatch):
+    headers = [OK_HOP, ("Reply-To", "Studentcorp <hello@intercom-mail.com>"), *aligned_auth("studentcorp.example")]
+    html = ('<p>Your landlord replied to your message.</p>'
+            '<a href="https://u123.intercom-clicks.com/via/abc">studentcorp.example/messages</a>'
+            '<a href="https://u123.intercom-clicks.com/via/def">Open the conversation</a>')
+    result = level_of(monkeypatch, "Studentcorp <notifications@studentcorp.example>", html, headers)
+    assert result["level"] == "low" and result["score"] < 30
+
+
+def test_webinar_from_the_same_sender_stays_low(monkeypatch):
+    headers = [OK_HOP, ("Reply-To", "Studentcorp <hello@intercom-mail.com>"), *aligned_auth("studentcorp.example")]
+    html = ('<p>Join our webinar on Thursday. Register now, places are limited.</p>'
+            '<a href="https://u123.intercom-clicks.com/via/xyz">https://studentcorp.example/webinar</a>')
+    result = level_of(monkeypatch, "Studentcorp <hello@studentcorp.example>", html, headers, body="Join our webinar. Register now.")
+    assert result["level"] == "low" and result["score"] < 30
+
+
+def test_access_code_with_a_tenant_domain_stays_low(monkeypatch):
+    html = '<p>Your one-time code: 123456</p><a href="https://acme.cloudflareaccess.com/cdn-cgi/access/login">Sign in</a>'
+    result = level_of(monkeypatch, "Cloudflare <noreply@notify.cloudflare.com>", html, [OK_HOP])
+    assert result["level"] == "low" and "lookalike_domain" not in codes(result)  # a known sending / access domain
+
+
+def test_train_operator_with_a_product_domain_stays_low(monkeypatch):
+    headers = [OK_HOP, *aligned_auth("connect.railco.example")]
+    html = '<p>Your ticket is ready.</p><a href="https://railco-connect.example/tickets/8">See my ticket</a>'
+    result = level_of(monkeypatch, "Railco <noreply@connect.railco.example>", html, headers)
+    assert result["level"] == "low" and result["score"] < 30 and "lookalike_domain" not in codes(result)
+    # the same link without any authentication is still a look-alike
+    result = level_of(monkeypatch, "Railco <noreply@connect.railco.example>", html, [OK_HOP], uid=2)
+    assert "lookalike_domain" in codes(result)
+
+
+def test_bank_notice_with_a_tracking_link_stays_low(monkeypatch):
+    headers = [OK_HOP, *aligned_auth("bankco.example")]
+    html = ('<p>Your statement is available.</p>'
+            '<a href="https://email.sparkpostmail.com/f/a/abc">https://www.bankco.example/statement</a>')
+    result = level_of(monkeypatch, "Bankco <service@bankco.example>", html, headers, body="Your statement is available.")
+    assert result["level"] == "low" and result["score"] < 30
+
+
+def test_survey_through_a_survey_platform_stays_low(monkeypatch):
+    html = '<p>Tell us what you think.</p><a href="https://lumenco.qualtrics.com/jfe/form/SV_abc">Take the survey</a>'
+    result = level_of(monkeypatch, "Lumenco <noreply@lumenco.example>", html, [OK_HOP])
+    assert result["level"] == "low" and "lookalike_domain" not in codes(result)
+
+
+def test_official_product_domain_with_aligned_dkim_stays_low(monkeypatch):
+    headers = [OK_HOP, *aligned_auth("phonebrand.example")]
+    html = '<p>Meet our new model.</p><a href="https://phonebrandmimo.example/model">Discover</a>'
+    result = level_of(monkeypatch, "Phonebrand <news@phonebrand.example>", html, headers)
+    assert result["level"] == "low" and "lookalike_domain" not in codes(result)
+    unsigned = level_of(monkeypatch, "Phonebrand <news@phonebrand.example>", html, [OK_HOP], uid=2)
+    assert "lookalike_domain" in codes(unsigned)  # without the alignment the same domain is a look-alike
+
+
+def test_platform_invitation_with_a_webmail_reply_to_is_at_least_medium(monkeypatch):
+    headers = [OK_HOP, ("Reply-To", "Dana <dana.martin@gmail.com>")]
+    html = '<p>Dana invited you to join a workspace.</p><a href="https://click.sparkpostmail.com/x">collabhub.example</a>'
+    result = level_of(monkeypatch, "Collabhub <invitations@collabhub.example>", html, headers)
+    assert result["level"] in ("medium", "high") and result["score"] >= 30
+    assert codes(result)["origin_mismatch"] == 25 and codes(result)["display_mismatch"] == 10
+
+
+def test_aligned_dkim_caps_the_weak_signals_but_not_a_bad_first_hop_or_idn():
+    signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
+    links = [{"url": "https://other.example/", "domain": "other.example", "mismatch": True, "shown": "shop.example"}]
+    result = phishing.phishing_score({"From": "Shop <noreply@shop.example>", **signed}, links, "")
+    assert codes(result) == {"display_mismatch": 5, "link_domain_mismatch": 5}
+    result = phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Received": [LOCALHOST_HOP[1]], **signed}, links, "")
+    assert codes(result) == {"origin_mismatch": 35, "display_mismatch": 10, "link_domain_mismatch": 15}
+    idn = [{"url": "https://xn--shp-fma.example/", "domain": "xn--shp-fma.example", "idn": True}]
+    assert codes(phishing.phishing_score({"From": "Shop <noreply@shop.example>", **signed}, idn, ""))["lookalike_domain"] == 30
+
+
+def test_reply_to_weight_depends_on_alignment_and_webmail():
+    signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
+    base = {"From": "Shop <noreply@shop.example>"}
+    assert codes(phishing.phishing_score({**base, **signed, "Reply-To": "x@platform.example"}, [], "")) == {"origin_mismatch": 5}
+    assert codes(phishing.phishing_score({**base, "Reply-To": "x@platform.example"}, [], "")) == {"origin_mismatch": 15}
+    assert codes(phishing.phishing_score({**base, "Reply-To": "x@gmail.com"}, [], "")) == {"origin_mismatch": 25}
+    assert codes(phishing.phishing_score({**base, **signed, "Reply-To": "x@laposte.net"}, [], "")) == {"origin_mismatch": 25}
+
+
+def test_lookalike_ignores_generic_words_and_known_sending_domains():
+    def lookalike(host, frm):
+        return "lookalike_domain" in codes(phishing.phishing_score({"From": frm}, [{"url": f"https://{host}/", "domain": host}], ""))
+    frm = "Lumenco <noreply@lumenco.example>"
+    assert not lookalike("lumenco-connect.example", "Connect <noreply@connect.example>")  # the only word is generic
+    assert not lookalike("acme.go.link", frm) and not lookalike("lumenco.qualtrics.com", frm) and not lookalike("lumenco.spmta.com", frm)
+    assert not lookalike("t.intercom-clicks.com", frm) and not lookalike("acme.cloudflareaccess.com", "Cloudflare <noreply@cloudflare.com>")
+    assert not lookalike("my-account-lumenco.example", "My Account <noreply@my-account.example>")
+    assert lookalike("lumenco-login.example", frm) and lookalike("secure-lumenco.example", frm)  # the brand is left once the generic word goes
+
+
+def test_crypto_lure_needs_the_vocabulary_and_a_link_off_the_sender_domain():
+    off = [{"url": "https://wallet-notif.example/", "domain": "wallet-notif.example"}]
+    own = [{"url": "https://www.coinco.example/", "domain": "www.coinco.example"}]
+    frm = {"From": "Coinco <notif@coinco.example>"}
+    def crypto(text, links=off, subject=""):
+        return "crypto_transaction_lure" in codes(phishing.phishing_score(frm, links, text, subject))
+    assert crypto("Review Transaction & Accept: 0.025 ETH pending in your wallet")
+    assert crypto("Votre transaction en attente sur votre portefeuille")
+    assert crypto("Never share your seed phrase")
+    assert crypto("hello", subject="Action Required: 0.5 BTC pending in your Wallet")
+    assert not crypto("Review Transaction & Accept: 0.025 ETH pending in your wallet", own)
+    assert not crypto("Add your card to Apple Wallet") and not crypto("Newsletter: methods and ethics")
+    assert not crypto("Review Transaction & Accept: 0.025 ETH pending in your wallet", [])
 
 
 def test_authentication_failures_and_spam_verdict():
@@ -327,7 +469,10 @@ def test_first_hop_judges_the_oldest_received_and_only_outside_clients():
     assert "origin_mismatch" not in hop(["from out.shop.example (out.shop.example [203.0.113.5]) by mx"])
     assert "origin_mismatch" not in hop(["by 2002:a05:6a00 with SMTP id x; Fri"])  # no "from" clause
     signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
-    assert "origin_mismatch" not in hop(["from [203.0.113.5] (helo=localhost) by mx"], **signed)  # authenticated: not improvised
+    assert codes(phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Received": ["from [203.0.113.5] (helo=localhost) by mx"], **signed},
+                                         [], ""))["origin_mismatch"] == 35  # a signature does not excuse an improvised first hop
+    assert "origin_mismatch" not in hop(["from [203.0.113.5] (helo=localhost) by mx with ESMTPSA"])  # SMTP AUTH: a mail client
+    assert "origin_mismatch" not in hop(["from localhost by mx"])  # no public address at all
 
 
 def test_placeholders_and_keywords_unit():

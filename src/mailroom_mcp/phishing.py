@@ -220,21 +220,38 @@ def extract_links(markup: str) -> list[dict]:
 #
 # phishing_score() adds up weighted signals, capped at 100. A signal is evidence, not proof: weights are chosen so
 # that no single weak signal reaches "medium", and a message needs several independent ones (or one strong one with
-# company) to reach "high". Newsletters sent through a mailing platform trigger the weak signals legitimately, so
-# those are attenuated when the destination is a known platform.
+# company) to reach "high". Newsletters and notifications sent through a mailing platform trigger the weak signals
+# legitimately, so those are attenuated twice: when the destination is a known sending / tracking domain, and when the
+# From domain signed the message.
 #
 #   code                   weight                                   what it means
 #   auth_fail              dmarc 35, spf 25, dkim 20, softfail 10   topmost Authentication-Results / Received-SPF
 #                          (sum, max 45)                            say the sender is not who it claims
 #   spam_flag              30 (flag / status "Yes", score>=required) the host's own antispam verdict
 #                          25 (score >= 5), 10 (score >= 2)
-#   origin_mismatch        25 first external hop with helo localhost / bare IP,
-#                          +15 Return-Path or Reply-To not aligned (max 40)   the From claims a brand, the path does not
-#   link_domain_mismatch   15 (5 if every other link is a known platform)    no link on the From domain
-#   lookalike_domain       35 brand word in another domain, 30 IDN only       a link imitates the sender's brand
-#   display_mismatch       35 (10 when the destination is a known platform)   the text shows another URL
-#   template_placeholder   20                                                 {prenom}, {{name}}, %FIRSTNAME% unfilled
-#   urgency_payment        6 per group (urgency, payment), max 12             pressure and money words, FR/EN
+#   origin_mismatch        35 first external hop from a public IP    whatever the From looks like (not for SMTP-AUTH
+#                          with helo localhost / bare IP / absent    submissions)
+#                          + Return-Path / Reply-To off the From     only when the From claims a company: 25 on a free
+#                          domain: 15, 5 with an aligned DKIM, 25    webmail, 15 without aligned DKIM, 5 with it
+#                          for a free webmail (max 60 in all)
+#   link_domain_mismatch   15 (5 if every other link is a known      no link on the From domain
+#                          platform)
+#   lookalike_domain       35 brand word in another domain, 30 IDN   a link imitates the sender's brand; generic
+#                          only                                     words, the From domain, known sending / tracking
+#                                                                   domains and, with an aligned DKIM, domains that
+#                                                                   hold the whole brand name (product sites) excepted
+#   display_mismatch       35 unknown destination; 10 when it is a   the text shows another URL
+#                          known platform or the DKIM is aligned
+#   crypto_transaction_lure 20                                        wallet / pending transaction / ETH / seed
+#                                                                   phrase wording (subject, text, button) next to a
+#                                                                   link off the From domain (never a known platform)
+#   template_placeholder   20                                        {prenom}, {{name}}, %FIRSTNAME% unfilled
+#   urgency_payment        6 per group (urgency, payment), max 12    pressure and money words, FR/EN
+#
+# "Aligned DKIM": a dkim=pass in the topmost Authentication-Results (and no dmarc fail) whose d= is the From's
+# organisational domain. When it is aligned AND the first hop is not improvised (origin_mismatch above), link_domain_mismatch,
+# display_mismatch and lookalike_domain are capped at 5 each, except a link to an IDN / punycode host, which keeps its
+# weight. An improvised first hop is never excused by a signature.
 #
 # Levels: score < 30 "low", 30..59 "medium", >= 60 "high".
 LEVEL_MEDIUM, LEVEL_HIGH = 30, 60
@@ -249,20 +266,26 @@ PLATFORMS = (
     "constantcontact.com", "rs6.net", "campaign-archive.com", "klaviyo.com", "klaviyomail.com", "sparkpostmail.com",
     "customeriomail.com", "mailgun.org", "mailgun.net", "mlsend.com", "mailerlite.com", "getresponse.com",
     "createsend.com", "emltrk.com", "cm-sender.net", "mailkit.eu", "sarbacane.com", "mailpv.net", "ymlp.com",
+    "intercom-mail.com", "intercom-clicks.com", "intercom.io", "cloudflareaccess.com", "notify.cloudflare.com",
+    "qualtrics.com", "qemailserver.com", "go.link", "spmta.com", "spmailtechno.com", "c.gle",
     "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "youtube.com", "apple.com", "google.com",
 )
 PLATFORM_PATTERN = re.compile(r"(?:^|\.)(?:cmail\d+\.com|sendib[tm]\d+\.com)$")
 FREEMAIL = ("gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "hotmail.fr", "live.com", "live.fr", "yahoo.com",
             "yahoo.fr", "icloud.com", "me.com", "orange.fr", "wanadoo.fr", "free.fr", "sfr.fr", "laposte.net", "proton.me",
-            "protonmail.com", "gmx.com", "gmx.fr", "aol.com", "msn.com")
+            "protonmail.com", "gmx.com", "gmx.fr", "gmx.net", "gmx.de", "aol.com", "msn.com", "outlook.fr", "ymail.com",
+            "yahoo.co.uk", "hotmail.co.uk")
 # Local parts of an address a company sends from (not a person): the From claims to be an organisation.
-ROLE_PREFIXES = ("noreply", "donotreply", "notification", "newsletter", "service", "support", "contact", "info", "news",
+ROLE_PREFIXES = ("noreply", "donotreply", "notif", "notification", "newsletter", "service", "support", "contact", "info", "news",
                  "alert", "mailer", "billing", "account", "security", "order", "commande", "delivery", "shipping",
                  "customer", "client", "colis", "livraison", "facture", "invoice", "hello", "team", "admin")
 # Words too common in company names to prove an imitation.
 GENERIC_WORDS = ("france", "online", "service", "services", "mail", "email", "group", "groupe", "shop", "store", "paris",
                  "europe", "direct", "media", "news", "web", "club", "info", "bank", "banque", "assurance", "poste",
-                 "colis", "livraison", "client", "secure", "login", "account", "compte", "tracking", "suivi")
+                 "colis", "livraison", "client", "secure", "login", "account", "compte", "tracking", "suivi", "connect",
+                 "mails", "notify", "notification", "support", "cloud")
+# Generic only as a whole word of a domain name (go.link, my-brand, app-brand): inside a word they would eat the brand.
+GENERIC_TOKENS = ("go", "my", "app", "apps", "link", "links", "click", "clicks", "track")
 SECOND_LEVEL = {"co", "com", "org", "net", "gov", "ac", "edu"}
 
 PLACEHOLDER_WORDS = ("prenom", "prénom", "nom", "name", "firstname", "first_name", "lastname", "last_name", "fullname",
@@ -310,12 +333,20 @@ def freemail(domain: str) -> bool:
     return any(domain == d or domain.endswith("." + d) for d in FREEMAIL)
 
 
+_GENERIC_BY_LENGTH = sorted(GENERIC_WORDS, key=len, reverse=True)
+
+
 def _core(text: str) -> str:
     """A domain name reduced to letters and digits, with generic words turned into breaks."""
-    text = text.lower()
-    for word in sorted(GENERIC_WORDS, key=len, reverse=True):
-        text = text.replace(word, "|")
-    return re.sub(r"[^a-z0-9|]", "", text)
+    parts = []
+    for token in re.split(r"[^a-z0-9]+", text.lower()):
+        if token in GENERIC_TOKENS:
+            parts.append("|")
+            continue
+        for word in _GENERIC_BY_LENGTH:
+            token = token.replace(word, "|")
+        parts.append(token)
+    return "".join(parts)
 
 
 def _common(a: str, b: str) -> int:
@@ -438,8 +469,10 @@ def _first_hop(received: list[str]) -> str | None:
     helo = (explicit.group(1) if explicit else m.group(1)).strip("[]();,").lower()
     client = re.split(r"\sby\s", hop, maxsplit=1, flags=re.I)[0]
     ips = re.findall(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])", client) + re.findall(r"\[([0-9a-f:]*:[0-9a-f:]+)\]", client, re.I)
-    if ips and all(_private(ip) for ip in ips):
-        return None  # the client was on the server itself or a private network: an internal hand-over
+    if not ips or all(_private(ip) for ip in ips):
+        return None  # no public client address: the server itself, a private network, an internal hand-over
+    if re.search(r"\bwith\s+(?:E|L)?SMTPS?A\b|authenticated", hop, re.I):
+        return None  # SMTP AUTH submission: a logged-in mail client, not an improvised sender
     if helo in ("localhost", "localhost.localdomain", "unknown", "") or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", helo) \
             or ":" in helo:
         shown = f" from {ips[0]}" if ips else ""
@@ -447,24 +480,32 @@ def _first_hop(received: list[str]) -> str | None:
     return None
 
 
-def _origin(headers: dict, from_domain: str, brand: bool):
-    if not brand:
-        return None
+def _aligned(headers: dict, from_domain: str) -> bool:
+    """A dkim=pass (and no dmarc failure) in the topmost Authentication-Results, signed by the From's own domain."""
     auth = _authentication(headers)
-    if "pass" in auth.get("dkim", []) and "pass" in auth.get("dmarc", ["pass"]) and _signed_by(headers, from_domain):
-        return None
+    return bool(from_domain) and "pass" in auth.get("dkim", []) and "pass" in auth.get("dmarc", ["pass"]) \
+        and _signed_by(headers, from_domain)
+
+
+def _origin(headers: dict, from_domain: str, brand: bool, hop: str | None, aligned: bool):
     problems, weight = [], 0
-    if hop := _first_hop(headers.get("Received") or []):
+    if hop:  # whatever the From looks like
         problems.append(hop)
-        weight += 25
-    for name in ("Return-Path", "Reply-To"):
-        _, _, domain = _address(_first(headers, name))
-        if domain and not same_site(org_domain(domain), org_domain(from_domain)) and not on_platform(domain):
-            problems.append(f"{name} domain {domain} differs from From domain {from_domain}")
-            weight += 15
-            break
+        weight += 35
+    if brand:
+        worst = None
+        for name in ("Return-Path", "Reply-To"):
+            _, _, domain = _address(_first(headers, name))
+            if not domain or same_site(org_domain(domain), org_domain(from_domain)) or on_platform(domain):
+                continue
+            w = 25 if freemail(domain) else 5 if aligned else 15
+            if worst is None or w > worst[0]:
+                worst = (w, name, domain)
+        if worst:
+            problems.append(f"{worst[1]} domain {worst[2]} differs from From domain {from_domain}")
+            weight += worst[0]
     if problems:
-        return {"code": "origin_mismatch", "detail": "; ".join(problems), "weight": min(weight, 40)}
+        return {"code": "origin_mismatch", "detail": "; ".join(problems), "weight": min(weight, 60)}
 
 
 def _signed_by(headers: dict, from_domain: str) -> bool:
@@ -477,32 +518,67 @@ def _link_domains(links: list[dict]) -> list[str]:
     return list(dict.fromkeys(link["domain"] for link in links if link.get("domain")))
 
 
-def _link_signals(links: list[dict], from_domain: str, brand_label: str, brand: bool):
+def _link_signals(links: list[dict], from_domain: str, brand_label: str, aligned: bool, attenuate: bool):
+    """`aligned`: the From domain signed the mail; `attenuate`: aligned and the first hop is not improvised."""
+    def capped(weight: int, idn: bool = False) -> int:
+        return weight if idn or not attenuate else min(weight, 5)
+
     out = []
     hosts = _link_domains(links)
     if from_domain and hosts and not any(same_site(h, org_domain(from_domain)) for h in hosts) \
             and not freemail(from_domain):
         others = [h for h in hosts if not on_platform(h)]
-        out.append({"code": "link_domain_mismatch", "weight": 15 if others else 5,
+        out.append({"code": "link_domain_mismatch", "weight": capped(15 if others else 5),
                     "detail": f"No link on {org_domain(from_domain)}; links go to " + ", ".join(hosts[:3])
                               + (" (known mailing platforms)" if not others else "")})
     lookalikes = []
     if brand_label and from_domain:
+        whole = brand_label.replace("-", "")
         lookalikes = [h for h in hosts if not on_platform(h) and not same_site(h, org_domain(from_domain))
-                      and imitates(brand_label, h)]
+                      and imitates(brand_label, h)
+                      and not (aligned and len(whole) >= 4 and whole in re.sub(r"[^a-z0-9]", "", _label(h)))]
     idn = [link["domain"] for link in links if link.get("idn") and link.get("domain")]
     if lookalikes or idn:
-        out.append({"code": "lookalike_domain", "weight": 35 if lookalikes else 30,
+        out.append({"code": "lookalike_domain", "weight": capped(35, bool(idn)) if lookalikes else 30,
                     "detail": (f"Domain {lookalikes[0]} imitates the sender's name {brand_label!r}" if lookalikes
                                else f"Domain {idn[0]} uses look-alike (IDN/punycode) characters")})
-    shown = [link for link in links if link.get("mismatch")]
+    shown = []
+    for link in links:
+        if link.get("mismatch"):
+            platform = on_platform(link.get("domain", ""))
+            weight = 10 if platform or aligned else 35
+            shown.append((capped(weight, bool(link.get("idn"))), platform, link))
     if shown:
-        link = shown[0]
-        platform = on_platform(link.get("domain", ""))
-        out.append({"code": "display_mismatch", "weight": 10 if platform else 35,
+        weight, platform, link = max(shown, key=lambda t: t[0])
+        out.append({"code": "display_mismatch", "weight": weight,
                     "detail": f"Link text shows {link.get('shown')} but goes to {link.get('domain')}"
-                              + (" (known mailing platform)" if platform else "")})
+                              + (" (known mailing platform)" if platform else " (the sender signed the mail)" if aligned else "")})
     return out
+
+
+# Wording of a crypto-wallet scam ("pending transaction, review and accept"). One strong phrase is enough; the weak words
+# (wallet, ETH...) are everywhere in legitimate mail (Apple Wallet, a bank's "portefeuille"), so two different ones are needed.
+CRYPTO_STRONG = re.compile(
+    r"seed phrase|recovery phrase|secret phrase|phrase de r[ée]cup[ée]ration|phrase secr[èe]te|private key|cl[ée] priv[ée]e"
+    r"|pending (?:crypto )?transactions?|transactions? (?:is |are )?pending|transactions? en attente|airdrop"
+    r"|connect (?:your )?wallet|(?:review|accept|approve|confirm|validate|claim|examiner|valider|accepter|confirmer)\W+"
+    r"(?:(?:the|your|this|a|la|votre|cette)\W+)?(?:crypto\W+)?(?:transactions?|transfers?)", re.I)
+CRYPTO_WEAK = re.compile(r"\bwallets?\b|\bportefeuilles?\b|\b(?:eth|btc|usdt|usdc|xrp)\b|\bbitcoins?\b|\bethereum\b"
+                         r"|\bcrypto(?:currenc(?:y|ies)|monnaies?)?\b", re.I)
+
+
+def _crypto_lure(text: str, links: list[dict], from_domain: str):
+    strong = CRYPTO_STRONG.search(text)
+    weak = {m.group(0).lower() for m in CRYPTO_WEAK.finditer(text)}
+    if not strong and len(weak) < 2:
+        return None
+    outside = [h for h in _link_domains(links)
+               if not on_platform(h) and not (from_domain and same_site(h, org_domain(from_domain)))]
+    if not outside:
+        return None
+    words = (strong.group(0).lower(),) if strong else tuple(sorted(weak))[:2]
+    return {"code": "crypto_transaction_lure", "weight": 20,
+            "detail": f"Crypto wording ({', '.join(repr(w) for w in words)}) with a link outside the sender's domain: {outside[0]}"}
 
 
 def _text_signals(text: str) -> list[dict]:
@@ -522,18 +598,24 @@ def _text_signals(text: str) -> list[dict]:
     return out
 
 
-def phishing_score(headers: dict, links: list[dict], body_text: str) -> dict:
+def phishing_score(headers: dict, links: list[dict], body_text: str, subject: str = "") -> dict:
     """Suspicion of phishing, from what the other functions of this module extract; no network access.
 
     `headers` is the dict of `raw_headers`/`auth_headers`, `links` the list of `extract_links`, `body_text` the
-    text of the mail. Returns {score: 0-100, level: low|medium|high, reasons: [{code, detail, weight}]}, the
-    reasons by decreasing weight. A score is a hint to look closer, never a verdict."""
+    text of the mail, `subject` its subject (read for wording only). Returns {score: 0-100, level: low|medium|high,
+    reasons: [{code, detail, weight}]}, the reasons by decreasing weight. A score is a hint to look closer, never a
+    verdict."""
     name, local, from_domain = _address(_first(headers, "From"))
     brand = _claims_brand(name, local, from_domain)
     brand_label = re.sub(r"[^a-z0-9-]", "", org_domain(from_domain).split(".")[0]) if brand else ""
-    reasons = [r for r in (_auth_fail(headers), _spam_flag(headers), _origin(headers, from_domain, brand)) if r]
-    reasons += _link_signals(links, from_domain, brand_label, brand)
+    hop = _first_hop(headers.get("Received") or [])
+    aligned = _aligned(headers, from_domain)
+    reasons = [r for r in (_auth_fail(headers), _spam_flag(headers), _origin(headers, from_domain, brand, hop, aligned)) if r]
+    reasons += _link_signals(links, from_domain, brand_label, aligned, aligned and not hop)
     reasons += _text_signals(body_text or "")
+    shown = " ".join([subject or "", (body_text or "")[:BODY_SCAN_MAX]] + [link.get("text", "") for link in links])
+    if lure := _crypto_lure(shown, links, from_domain):
+        reasons.append(lure)
     reasons = sorted(({"code": r["code"], "detail": r["detail"], "weight": r["weight"]} for r in reasons),
                      key=lambda r: -r["weight"])
     score = min(sum(r["weight"] for r in reasons), 100)

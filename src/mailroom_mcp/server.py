@@ -2297,7 +2297,9 @@ def security_report(msg, markup: str | None, body: str, warnings: list) -> dict:
     full = phishing.raw_headers(msg)
     headers, cut = phishing.auth_headers(msg, full)
     links = sorted(phishing.extract_links(markup), key=lambda link: not link.get("mismatch")) if markup is not None else []
-    score = phishing.phishing_score(full, links, body)
+    signatures = phishing.dkim_signatures(msg)  # {d, s} only: the score needs the signing domain to tell an aligned DKIM
+    evidence = {**full, "DKIM-Signature": signatures} if signatures else full
+    score = phishing.phishing_score(evidence, links, body, (phishing.header_values(msg, "Subject") or [""])[0])
     report = {"phishing": score, "headers": headers}
     if markup is None:
         report["links"] = []

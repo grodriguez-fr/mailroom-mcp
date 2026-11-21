@@ -197,15 +197,19 @@ It comes with every page of a long text, so ask for it once.
   |---|---|---|
   | `auth_fail` | dmarc fail 35, spf fail 25, dkim fail 20, spf softfail 10 (sum, max 45) | topmost `Authentication-Results` (else the topmost ARC one, else `Received-SPF` for SPF); a later `Authentication-Results` is written by the sender and ignored |
   | `spam_flag` | 30 flag/status "Yes" or score >= required; 25 score >= 5; 10 score >= 2 | the mail host's `X-Spam-Flag`, `X-Spam-Status`, `X-Spam-Score`, `X-Spam-Bar` |
-  | `origin_mismatch` | 25 + 15 (max 40) | the From is a company address (`noreply@`, `service@`..., or the display name carries the domain's name) and the oldest `Received` hop comes from a public IP with HELO `localhost`, a bare IP or none; or `Return-Path` / `Reply-To` is on another domain than the From (mailing platforms excepted). Skipped when a DKIM signature of the From domain passed |
-  | `link_domain_mismatch` | 15; 5 if the other links are all known mailing platforms or large sites | no `http(s)` link is on the From domain (subdomains count); not for free mail providers |
-  | `lookalike_domain` | 35 brand word; 30 IDN only | a link's domain shares 5 letters in a row with the From domain's name without being it (`mondialrelay.fr` -> `ml-colis-relay.com`), generic words (`france`, `service`...) excepted; or an IDN / `xn--` host |
-  | `display_mismatch` | 35; 10 if the destination is a known mailing platform | a link whose text shows another URL (`mismatch`) |
+  | `origin_mismatch` | 35 improvised first hop; + 25 / 15 / 5 for Reply-To / Return-Path (max 60) | the oldest `Received` hop comes from a public IP with HELO `localhost`, a bare IP or none (35, whatever the From looks like; SMTP AUTH submissions excepted); and, when the From is a company address (`noreply@`, `service@`..., or the display name carries the domain's name), `Return-Path` / `Reply-To` on another domain than the From (mailing platforms excepted): 25 on a free webmail, else 15, or 5 when a DKIM signature of the From domain passed |
+  | `link_domain_mismatch` | 15; 5 if the other links are all known sending / tracking domains or large sites | no `http(s)` link is on the From domain (subdomains count); not for free mail providers |
+  | `lookalike_domain` | 35 brand word; 30 IDN only | a link's domain shares 5 letters in a row with the From domain's name without being it (`mondialrelay.fr` -> `ml-colis-relay.com`); generic words (`france`, `connect`, `service`, `login`...), the From domain, known sending / tracking domains and, with an aligned DKIM, domains holding the whole brand name (product sites) are excepted; or an IDN / `xn--` host |
+  | `display_mismatch` | 35 unknown destination; 10 if it is a known sending / tracking domain or the DKIM is aligned | a link whose text shows another URL (`mismatch`) |
+  | `crypto_transaction_lure` | 20 | wallet wording (`pending transaction`, `review and accept transaction`, `seed phrase`, `transaction en attente`, or two of `wallet`, `portefeuille`, `ETH`, `BTC`, `USDT`...) in the subject, text or a button, with a link outside the From domain and not a known platform |
   | `template_placeholder` | 20 | unfilled `{prenom}`, `{{name}}`, `%FIRSTNAME%`, `*\|FNAME\|*`, `[[nom]]` in the text |
   | `urgency_payment` | 6 per group, max 12 | urgency words (`urgent`, `sous 24 h`, `action required`...) and payment words (`paiement`, `IBAN`, `gift card`...), French and English |
 
-  A newsletter through a mailing platform (Brevo, Mailchimp, Sendgrid...) triggers only the weak, attenuated
-  signals and stays `low`. The list of platforms and the weights live at the top of the score section of
+  An *aligned DKIM* is a `dkim=pass` (and no dmarc failure) in the topmost `Authentication-Results` whose `d=` is
+  the From's own domain. When it is aligned and the first hop is not improvised, `link_domain_mismatch`,
+  `display_mismatch` and `lookalike_domain` are capped at 5 each (an IDN link keeps its weight): a newsletter or a
+  notification through a mailing platform (Brevo, Mailchimp, Intercom, SparkPost...) triggers only those and stays
+  `low`. The list of platforms and the weights live at the top of the score section of
   `phishing.py`.
 - `security.headers`: `From`, `Reply-To`, `Return-Path`, `Sender`, `Received` (always a list: every line, in message
   order, the receiving server's first), `Authentication-Results`, `ARC-Authentication-Results`, `Received-SPF`,
