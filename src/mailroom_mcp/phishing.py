@@ -3,6 +3,7 @@ destination of the links of its HTML body, and a suspicion score built from both
 nothing here opens a connection, and a link is never followed."""
 
 import ipaddress
+import json
 import re
 import unicodedata
 from email.header import decode_header, make_header
@@ -11,7 +12,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
 VALUE_MAX = 400          # characters of one header value
-RECEIVED_MAX = 20        # Received lines kept (the first ones: the last hops, written by your own server)
+RECEIVED_MAX = 20        # Received lines kept at most (both ends first: the receiving server's and the first external hop)
 LINK_URL_MAX = 300       # characters of a link URL (the domain is always complete)
 LINK_TEXT_MAX = 80       # characters of the text shown for a link
 
@@ -19,6 +20,7 @@ LINK_TEXT_MAX = 80       # characters of the text shown for a link
 HEADERS = ("From", "Reply-To", "Return-Path", "Sender", "Received", "Authentication-Results",
            "ARC-Authentication-Results", "Received-SPF", "X-Spam-Flag", "X-Spam-Status", "X-Spam-Score", "X-Spam-Bar",
            "X-Spam-Report", "Message-ID", "List-Unsubscribe")
+EVIDENCE_HEADERS = ("List-Id", "X-Google-Group-Id")   # read by the score only, never returned
 LONG_HEADERS = {"X-Spam-Report": 300}   # verbose by nature: shortened harder than VALUE_MAX
 RAW_HEADERS = {"Message-ID"}            # the parsed form stops at the first malformed character: keep the raw text
 
@@ -56,7 +58,7 @@ def cut(value: str, size: int) -> str:
 def raw_headers(msg) -> dict:
     """{header: value or [values]}, whole values: the evidence the score reads. Absent headers are left out."""
     out = {}
-    for name in HEADERS:
+    for name in HEADERS + EVIDENCE_HEADERS:
         if name in RAW_HEADERS:
             values = [unfold(str(v)) for k, v in msg.raw_items() if k.lower() == name.lower()]
         else:
@@ -67,13 +69,13 @@ def raw_headers(msg) -> dict:
 
 
 def auth_headers(msg, full: dict | None = None) -> tuple[dict, list[str]]:
-    """({header: value or [values]}, what was shortened). A header that is absent is left out."""
+    """({header: value or [values]}, what was shortened): every value cut to its size, every Received line kept (trim_evidence
+    drops lines to fit the budget). A header that is absent is left out."""
     out, shortened = {}, []
     for name, value in (full if full is not None else raw_headers(msg)).items():
+        if name not in HEADERS:
+            continue
         values = [value] if isinstance(value, str) else list(value)
-        if name == "Received" and len(values) > RECEIVED_MAX:
-            shortened.append(f"Received {RECEIVED_MAX}/{len(values)}")
-            values = values[:RECEIVED_MAX]
         size = LONG_HEADERS.get(name, VALUE_MAX)
         if any(len(v) > size for v in values):
             shortened.append(f"{name} (text)")
@@ -256,10 +258,19 @@ def extract_links(markup: str) -> list[dict]:
 #                          the receiving one, when the From claims    recipient's, with no aligned DKIM, from a From that
 #                          a company or a brand                       claims a company or a brand
 #                          + Return-Path / Reply-To off the From      only when the From claims a company: 25 on a free
-#                          domain: 15, 5 with an aligned DKIM, 25     webmail, 15 without aligned DKIM, 5 with it
-#                          for a free webmail (max 60 in all)
+#                          domain: 15, 5 with an aligned DKIM, 25     webmail, 15 without aligned DKIM, 5 with it.
+#                          for a free webmail (max 60 in all)         Return-Path: 0 at a known bounce / sending
+#                                                                   service (worldline.com, amazonses.com...) with an
+#                                                                   aligned DKIM, and 0 behind a group relay (List-Id,
+#                                                                   X-Google-Group-Id, googlegroups.com, "Name via
+#                                                                   Platform") when a DKIM of the From domain, of the
+#                                                                   group service or of the platform passed
 #   link_domain_mismatch   15 (5 if every other link is a known      no link on the From domain (a link shortener or
-#                          platform)                                  redirector is never a platform)
+#                          platform)                                  redirector is never a platform). With an aligned
+#                                                                   DKIM a link on the same registrable name under
+#                                                                   another suffix (bank.com / bank.fr / bank.co.uk)
+#                                                                   is the sender's own: no mismatch, no look-alike,
+#                                                                   no display mismatch for it
 #   lookalike_domain       35 brand word in another domain, 30 IDN   a link imitates the sender's brand; generic
 #                          only                                     words, the From domain, known sending / tracking
 #                                                                   domains and, with an aligned DKIM, domains that
@@ -270,18 +281,21 @@ def extract_links(markup: str) -> list[dict]:
 #                          name ("Amazon", "PayPal", a bank...)      DKIM signature of the From domain passed
 #                          15 a generic service title ("Service      the title is not backed by the address (a
 #                          Client", "Support", "Sécurité"),          "support@" for a "Support") nor by the company
-#                          30 next to any other signal but           name in the display name
-#                          link_domain_mismatch / urgency_payment
+#                          30 next to any other signal but           name in the display name. A mail with no http(s)
+#                          link_domain_mismatch / urgency_payment    link at all: generic title 0 when a DKIM passed,
+#                          0 / 10: see the right                     brand 10 when a relay's own DKIM passed ("EDF via
+#                                                                   Platform"). Never next to an improvised first hop
 #   crypto_transaction_lure 20                                        wallet / pending transaction / ETH / seed
 #                                                                   phrase wording (subject, text, button) next to a
 #                                                                   link off the From domain (never a known platform)
 #   template_placeholder   20                                        {prenom}, {{name}}, %FIRSTNAME% unfilled
 #   urgency_payment        6 per group (urgency, payment), max 12    pressure and money words, FR/EN
 #
-# "Aligned DKIM": a dkim=pass in the topmost Authentication-Results (and no dmarc fail) whose d= is the From's
-# organisational domain. When it is aligned AND the first hop is not "localhost" from a public IP, link_domain_mismatch,
+# "Aligned DKIM": a dkim=pass in the topmost Authentication-Results (and no dmarc fail: dmarc=none does not count as one)
+# whose d= is the From's organisational domain. When it is aligned AND the first hop is not "localhost" from a public IP, link_domain_mismatch,
 # display_mismatch and lookalike_domain are capped at 5 each, except a link to an IDN / punycode host, which keeps its
-# weight. A "localhost" first hop from a public address is never excused by a signature.
+# weight. A "localhost" first hop from a public address is never excused by a signature: none of the attenuations above
+# (same brand, bounce service, relay, no-link titles) applies then, nor without an aligned DKIM.
 #
 # Levels: score < 30 "low", 30..59 "medium", >= 60 "high".
 LEVEL_MEDIUM, LEVEL_HIGH = 30, 60
@@ -341,6 +355,12 @@ GENERIC_TITLES = {
 }
 GENERIC_NAME = re.compile(r"(?<![a-z0-9])(" + "|".join(sorted((re.escape(t) for t in GENERIC_TITLES), key=len, reverse=True))
                           + r")(?![a-z0-9])")
+# Bounce / sending services: a Return-Path there says nothing about who wrote the mail once the From domain signed it.
+BOUNCE_SERVICES = ("worldline.com", "brevo.com", "sendinblue.com", "sparkpostmail.com", "mandrillapp.com", "amazonses.com",
+                   "mailgun.org", "mailgun.net", "mailgun.com", "sendgrid.net", "sendgrid.com", "mcsv.net", "rsgsv.net",
+                   "bounces.google.com", "googlegroups.com", "postmarkapp.com", "pstmrk.it", "mailjet.com")
+# Group / list relays whose own DKIM signature vouches for a mail they forward (registrable domains).
+GROUP_RELAYS = ("googlegroups.com", "google.com", "groups.io")
 LOCALHOSTS = ("localhost", "localhost.localdomain")
 CONTAINER_HELO = re.compile(r"(?:[0-9a-f]{12}|[0-9a-f]{64})")   # a container's default hostname (docker short / long id)
 FREEMAIL = ("gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "hotmail.fr", "live.com", "live.fr", "yahoo.com",
@@ -551,7 +571,7 @@ def _hops(received: list[str]) -> list[dict]:
     """The Received lines with a "from" clause, oldest first: {helo, ips (of the client), by (host), loopback, text}.
     A line without "from" (webmail, internal hand-over) has nothing to judge."""
     out = []
-    for hop in reversed(received):
+    for index, hop in reversed(list(enumerate(received))):
         m = re.match(r"\s*from\s+(\S+)", hop, re.I)
         if not m:
             continue
@@ -560,9 +580,14 @@ def _hops(received: list[str]) -> list[dict]:
         client = re.split(r"\sby\s", hop, maxsplit=1, flags=re.I)[0]
         ips = re.findall(_IPV4, client) + re.findall(r"\[(?:ipv6:)?([0-9a-f:]*:[0-9a-f:]+)\]", client, re.I)
         by = re.search(r"\sby\s+([^\s(;\[]+)", hop, re.I)
-        out.append({"helo": helo, "ips": ips, "by": by.group(1).strip("[]();,").lower() if by else "", "text": hop,
+        out.append({"index": index, "helo": helo, "ips": ips, "by": by.group(1).strip("[]();,").lower() if by else "", "text": hop,
                     "loopback": helo in LOCALHOSTS or bool(_LOOPBACK.search(hop.split(";")[0]))})
     return out
+
+
+def _external(hops: list[dict]) -> dict | None:
+    """The first external hop: the oldest one whose client has a public IP."""
+    return next((h for h in hops if any(not _private(ip) for ip in h["ips"])), None)
 
 
 def _bare_ip(helo: str) -> bool:
@@ -582,7 +607,7 @@ def _origin_hop(received: list[str], aligned: bool, claims: bool) -> dict | None
     from that, a `localhost` hand-over on a server that is not the receiving one, from a From that claims a company or
     a brand without a DKIM of its own domain, is the local machine of a third party writing under that name."""
     hops = _hops(received)
-    external = next((h for h in hops if any(not _private(ip) for ip in h["ips"])), None)
+    external = _external(hops)
     if external:
         text, helo = external["text"], external["helo"]
         ip = next(ip for ip in external["ips"] if not _private(ip))
@@ -608,13 +633,15 @@ def _by(line: str) -> str:
 
 
 def _aligned(headers: dict, from_domain: str) -> bool:
-    """A dkim=pass (and no dmarc failure) in the topmost Authentication-Results, signed by the From's own domain."""
-    auth = _authentication(headers)
-    return bool(from_domain) and "pass" in auth.get("dkim", []) and "pass" in auth.get("dmarc", ["pass"]) \
-        and _signed_by(headers, from_domain)
+    """A dkim=pass in the topmost Authentication-Results, signed by the From's own domain (header.d of the result or d= of
+    a signature). A dmarc failure cancels it; dmarc=none or an unknown dmarc result does not."""
+    return bool(from_domain) and org_domain(from_domain) in _dkim_pass_domains(headers)
 
 
-def _origin(headers: dict, from_domain: str, brand: bool, hop: dict | None, aligned: bool):
+def _origin(headers: dict, from_domain: str, brand: bool, hop: dict | None, aligned: bool, trusted: bool = True,
+            relay: bool = False):
+    """`trusted`: the first hop is not an improvised "localhost" (no attenuation otherwise); `relay`: a group relay
+    that a passing DKIM vouches for."""
     problems, weight = [], 0
     if hop:  # whatever the From looks like
         problems.append(hop["detail"])
@@ -624,6 +651,10 @@ def _origin(headers: dict, from_domain: str, brand: bool, hop: dict | None, alig
         for name in ("Return-Path", "Reply-To"):
             _, _, domain = _address(_first(headers, name))
             if not domain or same_site(org_domain(domain), org_domain(from_domain)) or on_platform(domain):
+                continue
+            if name == "Return-Path" and trusted and ((aligned and _host_in(domain, BOUNCE_SERVICES)) or relay):
+                continue  # a bounce service under a signed From, or the relay of a group: not who wrote it
+            if name == "Reply-To" and relay and _host_in(domain, GROUP_RELAYS):
                 continue
             w = 25 if freemail(domain) else 5 if aligned else 15
             if worst is None or w > worst[0]:
@@ -635,10 +666,61 @@ def _origin(headers: dict, from_domain: str, brand: bool, hop: dict | None, alig
         return {"code": "origin_mismatch", "detail": "; ".join(problems), "weight": min(weight, 60)}
 
 
-def _signed_by(headers: dict, from_domain: str) -> bool:
-    """A DKIM signature whose domain is the From domain's: only worth something next to a dkim=pass."""
-    return any(sig.get("d") and same_site(org_domain(sig["d"].lower()), org_domain(from_domain))
-               for sig in headers.get("DKIM-Signature") or [] if isinstance(sig, dict))
+def _host_in(host: str, domains: tuple[str, ...]) -> bool:
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def _reg_label(host: str) -> str:
+    """The registrable name without its public suffix (fortuneo for fortuneo.com, www.fortuneo.fr, fortuneo.co.uk)."""
+    return org_domain(host).split(".")[0]
+
+
+def _same_brand(host: str, from_domain: str) -> bool:
+    """The same registrable name as the From domain under another suffix (bank.com / bank.fr / bank.co.uk). Only worth
+    something next to an aligned DKIM: anyone can register bank.xyz."""
+    org = org_domain(host)
+    label = _reg_label(host)
+    return bool(from_domain) and len(label) >= 3 and label == _reg_label(from_domain) and org not in SHARED_HOSTING \
+        and not redirector(host)
+
+
+def _dkim_pass_domains(headers: dict) -> set[str]:
+    """Registrable domains that signed the mail while the topmost Authentication-Results says dkim=pass (and no dmarc
+    failure): the d= of the signatures and the header.d of the passing results. Empty when nothing passed."""
+    auth = _authentication(headers)
+    if "pass" not in auth.get("dkim", []) or "fail" in auth.get("dmarc", []):
+        return set()
+    line = _first(headers, "Authentication-Results") or _first(headers, "ARC-Authentication-Results")
+    domains = {org_domain(d.lower()) for d in re.findall(r"dkim\s*=\s*pass[^;]*?header\.d\s*=\s*([a-z0-9.-]+)", line, re.I)}
+    return domains | {org_domain(sig["d"].lower()) for sig in headers.get("DKIM-Signature") or []
+                      if isinstance(sig, dict) and sig.get("d")}
+
+
+def _via(name: str) -> str:
+    """The platform of a "Name via Platform" display name (first word, plain), '' when there is none."""
+    m = re.search(r"\bvia\s+([a-z0-9]+)", _plain(name))
+    return m.group(1) if m else ""
+
+
+def _relay_vouched(headers: dict, name: str, from_domain: str, passed: set[str]) -> bool:
+    """The mail went through a group / list relay (List-Id, X-Google-Group-Id, a Return-Path at a known group service, or
+    "Name via Platform") and a passing DKIM signature vouches for it: the From domain's, a known group service's, or
+    the named platform's. `passed` is empty when no DKIM passed or the first hop is improvised."""
+    if not passed:
+        return False
+    _, _, return_path = _address(_first(headers, "Return-Path"))
+    via = _via(name)
+    if not (_first(headers, "List-Id") or _first(headers, "X-Google-Group-Id") or via
+            or (return_path and _host_in(return_path, GROUP_RELAYS + ("bounces.google.com",)))):
+        return False
+    if passed & ({org_domain(from_domain)} | set(GROUP_RELAYS)):
+        return True
+    return len(via) >= 3 and any(via in d.split(".")[0] or (len(d.split(".")[0]) >= 3 and d.split(".")[0] in via) for d in passed)
+
+
+def _has_link(links: list[dict], text: str) -> bool:
+    """Any http(s) link, in the HTML links or written in the text."""
+    return bool(_link_domains(links)) or bool(re.search(r"https?://", text or "", re.I))
 
 
 def _plain(text: str) -> str:
@@ -681,25 +763,36 @@ def _link_domains(links: list[dict]) -> list[str]:
     return list(dict.fromkeys(link["domain"] for link in links if link.get("domain")))
 
 
+def _internal(from_domain: str, attenuate: bool):
+    """Is a host one of the sender's own? The From domain (subdomains included) or, with an aligned DKIM, the same
+    registrable name under another suffix."""
+    return lambda host: bool(from_domain) and (same_site(host, org_domain(from_domain))
+                                               or (attenuate and _same_brand(host, from_domain)))
+
+
+def _lookalike_hosts(links: list[dict], from_domain: str, brand_label: str, aligned: bool, attenuate: bool) -> list[str]:
+    if not (brand_label and from_domain):
+        return []
+    internal, whole = _internal(from_domain, attenuate), brand_label.replace("-", "")
+    return [h for h in _link_domains(links) if not on_platform(h) and not internal(h) and imitates(brand_label, h)
+            and not (aligned and len(whole) >= 4 and whole in re.sub(r"[^a-z0-9]", "", _label(h)))]
+
+
 def _link_signals(links: list[dict], from_domain: str, brand_label: str, aligned: bool, attenuate: bool):
-    """`aligned`: the From domain signed the mail; `attenuate`: aligned and the first hop is not improvised."""
+    """`aligned`: the From domain signed the mail; `attenuate`: aligned and the first hop is not improvised. With it, a
+    link on the same registrable name under another suffix (bank.com / bank.fr) is the sender's own."""
     def capped(weight: int, idn: bool = False) -> int:
         return weight if idn or not attenuate else min(weight, 5)
 
+    internal = _internal(from_domain, attenuate)
     out = []
     hosts = _link_domains(links)
-    if from_domain and hosts and not any(same_site(h, org_domain(from_domain)) for h in hosts) \
-            and not freemail(from_domain):
+    if from_domain and hosts and not any(internal(h) for h in hosts) and not freemail(from_domain):
         others = [h for h in hosts if not on_platform(h)]
         out.append({"code": "link_domain_mismatch", "weight": capped(15 if others else 5),
                     "detail": f"No link on {org_domain(from_domain)}; links go to " + ", ".join(hosts[:3])
                               + (" (known mailing platforms)" if not others else "")})
-    lookalikes = []
-    if brand_label and from_domain:
-        whole = brand_label.replace("-", "")
-        lookalikes = [h for h in hosts if not on_platform(h) and not same_site(h, org_domain(from_domain))
-                      and imitates(brand_label, h)
-                      and not (aligned and len(whole) >= 4 and whole in re.sub(r"[^a-z0-9]", "", _label(h)))]
+    lookalikes = _lookalike_hosts(links, from_domain, brand_label, aligned, attenuate)
     idn = [link["domain"] for link in links if link.get("idn") and link.get("domain")]
     if lookalikes or idn:
         out.append({"code": "lookalike_domain", "weight": capped(35, bool(idn)) if lookalikes else 30,
@@ -708,6 +801,8 @@ def _link_signals(links: list[dict], from_domain: str, brand_label: str, aligned
     shown = []
     for link in links:
         if link.get("mismatch"):
+            if attenuate and not link.get("idn") and internal(link.get("domain", "")) and internal(link.get("shown", "")):
+                continue  # the sender's own name shown, the sender's own brand behind it
             platform = on_platform(link.get("domain", ""))
             weight = 10 if platform or aligned else 35
             shown.append((capped(weight, bool(link.get("idn"))), platform, link))
@@ -730,13 +825,13 @@ CRYPTO_WEAK = re.compile(r"\bwallets?\b|\bportefeuilles?\b|\b(?:eth|btc|usdt|usd
                          r"|\bcrypto(?:currenc(?:y|ies)|monnaies?)?\b", re.I)
 
 
-def _crypto_lure(text: str, links: list[dict], from_domain: str):
+def _crypto_lure(text: str, links: list[dict], from_domain: str, attenuate: bool = False):
     strong = CRYPTO_STRONG.search(text)
     weak = {m.group(0).lower() for m in CRYPTO_WEAK.finditer(text)}
     if not strong and len(weak) < 2:
         return None
-    outside = [h for h in _link_domains(links)
-               if not on_platform(h) and not (from_domain and same_site(h, org_domain(from_domain)))]
+    internal = _internal(from_domain, attenuate)
+    outside = [h for h in _link_domains(links) if not on_platform(h) and not internal(h)]
     if not outside:
         return None
     words = (strong.group(0).lower(),) if strong else tuple(sorted(weak))[:2]
@@ -761,6 +856,21 @@ def _text_signals(text: str) -> list[dict]:
     return out
 
 
+def _context(headers: dict) -> dict:
+    """What the signals share: the From split up, its alignment with the DKIM, the first hop and what attenuates."""
+    name, local, from_domain = _address(_first(headers, "From"))
+    brand = _claims_brand(name, local, from_domain)
+    aligned = _aligned(headers, from_domain)
+    named = _display_name(name, local, from_domain, aligned)
+    hop = _origin_hop(headers.get("Received") or [], aligned, brand or named is not None)
+    trusted = not (hop and hop["kind"] == "localhost")   # a "localhost" hand-over from a public IP is never excused
+    passed = _dkim_pass_domains(headers) if trusted else set()
+    return {"name": name, "local": local, "from_domain": from_domain, "brand": brand, "named": named, "hop": hop,
+            "brand_label": re.sub(r"[^a-z0-9-]", "", org_domain(from_domain).split(".")[0]) if brand else "",
+            "aligned": aligned, "attenuate": aligned and trusted, "trusted": trusted, "passed": passed,
+            "relay": _relay_vouched(headers, name, from_domain, passed)}
+
+
 def phishing_score(headers: dict, links: list[dict], body_text: str, subject: str = "") -> dict:
     """Suspicion of phishing, from what the other functions of this module extract; no network access.
 
@@ -768,28 +878,119 @@ def phishing_score(headers: dict, links: list[dict], body_text: str, subject: st
     text of the mail, `subject` its subject (read for wording only). Returns {score: 0-100, level: low|medium|high,
     reasons: [{code, detail, weight}]}, the reasons by decreasing weight. A score is a hint to look closer, never a
     verdict."""
-    name, local, from_domain = _address(_first(headers, "From"))
-    brand = _claims_brand(name, local, from_domain)
-    brand_label = re.sub(r"[^a-z0-9-]", "", org_domain(from_domain).split(".")[0]) if brand else ""
-    aligned = _aligned(headers, from_domain)
-    named = _display_name(name, local, from_domain, aligned)
-    hop = _origin_hop(headers.get("Received") or [], aligned, brand or named is not None)
-    reasons = [r for r in (_auth_fail(headers), _spam_flag(headers), _origin(headers, from_domain, brand, hop, aligned)) if r]
-    reasons += _link_signals(links, from_domain, brand_label, aligned, aligned and not (hop and hop["kind"] == "localhost"))
+    c = _context(headers)
+    from_domain, hop, aligned, attenuate = c["from_domain"], c["hop"], c["aligned"], c["attenuate"]
+    reasons = [r for r in (_auth_fail(headers), _spam_flag(headers),
+                           _origin(headers, from_domain, c["brand"], hop, aligned, c["trusted"], c["relay"])) if r]
+    reasons += _link_signals(links, from_domain, c["brand_label"], aligned, attenuate)
     reasons += _text_signals(body_text or "")
     shown = " ".join([subject or "", (body_text or "")[:BODY_SCAN_MAX]] + [link.get("text", "") for link in links])
-    if lure := _crypto_lure(shown, links, from_domain):
+    if lure := _crypto_lure(shown, links, from_domain, attenuate):
         reasons.append(lure)
-    if named:
-        kind, words = named
+    if c["named"]:
+        kind, words = c["named"]
         weak = {"link_domain_mismatch", "urgency_payment"}
         weight = 30 if kind == "brand" or any(r["code"] not in weak for r in reasons) else 15
-        reasons.append({"code": "display_name_brand_mismatch", "weight": weight,
-                        "detail": (f"Display name claims {words!r} but {from_domain} is not that brand's domain"
-                                   if kind == "brand" else f"Generic service title {words!r} that the address does not back")
-                                  + " and no DKIM of the From domain passed"})
+        silent = not _has_link(links, body_text)
+        if silent and kind == "generic" and c["passed"]:
+            weight = 0    # no link to be lured to, and a DKIM passed: a title on an internal or relayed mail
+        elif silent and kind == "brand" and c["relay"]:
+            weight = 10   # "Brand via Platform" with the platform's own signature and nothing to click
+        if weight:
+            reasons.append({"code": "display_name_brand_mismatch", "weight": weight,
+                            "detail": (f"Display name claims {words!r} but {from_domain} is not that brand's domain"
+                                       if kind == "brand" else f"Generic service title {words!r} that the address does not back")
+                                      + " and no DKIM of the From domain passed"})
     reasons = sorted(({"code": r["code"], "detail": r["detail"], "weight": r["weight"]} for r in reasons),
                      key=lambda r: -r["weight"])
     score = min(sum(r["weight"] for r in reasons), 100)
     level = "high" if score >= LEVEL_HIGH else "medium" if score >= LEVEL_MEDIUM else "low"
     return {"score": score, "level": level, "reasons": reasons}
+
+
+# --- What to keep when the report is too big ---
+
+def order_links(headers: dict, links: list[dict]) -> tuple[list[dict], int]:
+    """(links with the flagged ones first, how many are flagged): a text that shows another domain, then an IDN host or a
+    look-alike of the sender's name, then the others, each group in message order."""
+    c = _context(headers)
+    lookalikes = set(_lookalike_hosts(links, c["from_domain"], c["brand_label"], c["aligned"], c["attenuate"]))
+
+    def rank(link):
+        return 0 if link.get("mismatch") else 1 if link.get("idn") or link.get("domain") in lookalikes else 2
+    ordered = sorted(links, key=rank)
+    return ordered, sum(1 for link in links if rank(link) < 2)
+
+
+def _size(value) -> int:
+    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+# Headers by priority when the report has to be cut (the phishing block comes before all of them, and the flagged links
+# before the Received lines). The first two groups are always kept.
+KEEP_AUTH = ("Authentication-Results", "ARC-Authentication-Results", "Received-SPF", "X-Spam-Status", "X-Spam-Score",
+             "X-Spam-Flag", "DKIM-Signature")
+KEEP_IDENTITY = ("From", "Reply-To", "Return-Path", "Sender", "Message-ID")
+KEEP_LAST = ("X-Spam-Bar", "X-Spam-Report", "List-Unsubscribe")
+
+
+def received_priority(received: list[str]) -> list[int]:
+    """Indexes of the Received lines in the order to keep them: the receiving server's own line (the first), the first
+    external hop, then the others from both ends towards the middle."""
+    order = [0] if received else []
+    external = _external(_hops(received))
+    if external and external["index"] not in order:
+        order.append(external["index"])
+    rest = [i for i in range(len(received)) if i not in order]
+    while rest:   # from both ends towards the middle
+        order.append(rest.pop(0))
+        if rest:
+            order.append(rest.pop())
+    return order
+
+
+def trim_evidence(score: dict, headers: dict, links: list[dict], flagged: int, budget: int) -> tuple[dict, list[dict], list[str]]:
+    """(headers, links, what was cut) within `budget` characters of compact JSON, `score` being counted first.
+
+    Priority, from the last to be cut: the phishing block; authentication headers (Authentication-Results, ARC,
+    Received-SPF, X-Spam-Status / Score / Flag, DKIM-Signature); From / Reply-To / Return-Path / Sender / Message-ID;
+    the flagged links; the Received lines (the receiving server's and the first external hop first, the middle
+    first to go); the other links; X-Spam-Bar / X-Spam-Report / List-Unsubscribe. Once something does not fit,
+    nothing of a lower priority is kept."""
+    used = _size(score) + 300   # the phishing block, the object keys and room for `capped`
+    kept = {}
+    for name in KEEP_AUTH + KEEP_IDENTITY:
+        if name in headers:
+            kept[name] = headers[name]
+            used += len(name) + _size(headers[name]) + 4
+    room = True
+    dropped: list[str] = []
+
+    def take(cost: int) -> bool:
+        nonlocal used, room
+        room = room and used + cost <= budget
+        used += cost if room else 0
+        return room
+
+    kept_links = [link for link in links[:flagged] if take(_size(link) + 1)]
+    received = headers.get("Received") or []
+    keep_lines = []
+    for index in received_priority(received)[:RECEIVED_MAX]:
+        if take(_size(received[index]) + 1 + (0 if keep_lines else 14)):
+            keep_lines.append(index)
+    if keep_lines:
+        kept["Received"] = [received[i] for i in sorted(keep_lines)]
+    if len(keep_lines) < len(received):
+        dropped.append(f"Received {len(keep_lines)}/{len(received)}")
+    kept_links += [link for link in links[flagged:] if take(_size(link) + 1)]
+    for name in KEEP_LAST:
+        if name in headers:
+            if take(len(name) + _size(headers[name]) + 4):
+                kept[name] = headers[name]
+            else:
+                dropped.append(name)
+    if len(kept_links) < len(links):
+        dropped.append(f"links {len(kept_links)}/{len(links)}")
+    # the most important headers first: a reader that stops early has read the authentication results
+    ordered = {name: kept[name] for name in (*KEEP_AUTH, *KEEP_IDENTITY, "Received", *KEEP_LAST) if name in kept}
+    return ordered, kept_links, dropped

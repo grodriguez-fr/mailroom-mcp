@@ -206,16 +206,31 @@ It comes with every page of a long text, so ask for it once.
   | `template_placeholder` | 20 | unfilled `{prenom}`, `{{name}}`, `%FIRSTNAME%`, `*\|FNAME\|*`, `[[nom]]` in the text |
   | `urgency_payment` | 6 per group, max 12 | urgency words (`urgent`, `sous 24 h`, `action required`...) and payment words (`paiement`, `IBAN`, `gift card`...), French and English |
 
-  An *aligned DKIM* is a `dkim=pass` (and no dmarc failure) in the topmost `Authentication-Results` whose `d=` is
-  the From's own domain. When it is aligned and the first hop is not `localhost` from a public IP, `link_domain_mismatch`,
-  `display_mismatch` and `lookalike_domain` are capped at 5 each (an IDN link keeps its weight): a newsletter or a
-  notification through a mailing platform (Brevo, Mailchimp, Intercom, SparkPost...) triggers only those and stays
-  `low`. The list of platforms and the weights live at the top of the score section of
-  `phishing.py`.
+  An *aligned DKIM* is a `dkim=pass` (and no dmarc failure: `dmarc=none` is not one) in the topmost
+  `Authentication-Results` whose `d=` is the From's own domain. When it is aligned and the first hop is not `localhost`
+  from a public IP, `link_domain_mismatch`, `display_mismatch` and `lookalike_domain` are capped at 5 each (an IDN link
+  keeps its weight): a newsletter or a notification through a mailing platform (Brevo, Mailchimp, Intercom,
+  SparkPost...) triggers only those and stays `low`. The list of platforms and the weights live at the top of the score
+  section of `phishing.py`.
+
+  Attenuations that need that same alignment (or a passing relay signature) and a first hop that is not an improvised
+  `localhost`; without them nothing changes:
+  - *same brand, other suffix*: a link whose registrable name (the label before the public suffix: `fortuneo` in
+    `fortuneo.com`, `fortuneo.fr`, `fortuneo.co.uk`) is the From's counts as the sender's own: no `link_domain_mismatch`,
+    `lookalike_domain` or `display_mismatch` for it. Without an aligned DKIM it is a look-alike as before (anyone can
+    register `<brand>.xyz`).
+  - `origin_mismatch`, Return-Path leg: 0 at a known bounce / sending service (`worldline.com`, Brevo, SparkPost,
+    Mandrill, Amazon SES, Mailgun, SendGrid, `mcsv.net`, `rsgsv.net`, `bounces.google.com`, `googlegroups.com`...) with
+    an aligned DKIM; 0 behind a group relay (`List-Id`, `X-Google-Group-Id`, a Return-Path at a group service, or a
+    `Name via Platform` From) when a DKIM of the From domain, of the group service or of the named platform passed.
+  - `display_name_brand_mismatch`, in a mail with no `http(s)` link at all (HTML links or text): a generic title is 0 when
+    a DKIM passed; a known brand is 10 instead of 30 when a relay's own DKIM passed (`EDF via <platform>`).
+  - `display_mismatch` stays at 5 when the text shows the sender's own domain and the destination is a known sending /
+    tracking domain, and is dropped when the destination is the sender's own brand.
 - `security.headers`: `From`, `Reply-To`, `Return-Path`, `Sender`, `Received` (always a list: every line, in message
   order, the receiving server's first), `Authentication-Results`, `ARC-Authentication-Results`, `Received-SPF`,
   `X-Spam-Flag`, `X-Spam-Status`, `X-Spam-Score`, `X-Spam-Bar`, `X-Spam-Report` (cut at 300 characters),
-  `Message-ID` (raw text), `List-Unsubscribe`; absent ones are left out, a repeated one is a list. `DKIM-Signature` is a list of
+  `Message-ID` (raw text), `List-Unsubscribe`; absent ones are left out (`List-Id` and `X-Google-Group-Id` are read by the score only), a repeated one is a list. `DKIM-Signature` is a list of
   `{d, s}` (signing domain and selector): the signature itself is never returned. Authentication-Results lines
   other than the one your own server added are written by the sender: only the topmost is evidence.
 - `security.links`: the `<a href>` of the HTML body, deduplicated on URL and displayed text (`count` when repeated):
@@ -227,8 +242,16 @@ It comes with every page of a long text, so ask for it once.
   `xn--` labels (look-alike characters). Flagged links come first. Links without target (`#…`, empty) and relative
   links are left out; links of a mail without HTML part are not listed (a warning says so).
 - Size: a value is cut at 400 characters (`…`), `Received` at 20 lines, a URL at 300 characters (its `domain` stays
-  complete), and links at the size budget of a list page. Anything cut is named in `security.capped`
-  `{reason: "size", resumable: false, cut: ["Received 20/27", "links 31/80"]}`, with a warning.
+  complete), and the whole `security` object at the size budget of a list page (7,500 characters). When something has to
+  go, the last in this list goes first: (1) the `phishing` block, (2) `Authentication-Results`,
+  `ARC-Authentication-Results`, `Received-SPF`, `X-Spam-Status` / `-Score` / `-Flag`, `DKIM-Signature`, (3) `From`,
+  `Reply-To`, `Return-Path`, `Sender`, `Message-ID`, (4) flagged links (`mismatch`, `idn`, look-alike of the sender's
+  name), (5) `Received` (the receiving server's line and the first external hop are kept, the middle goes first),
+  (6) the other links, (7) `X-Spam-Bar`, `X-Spam-Report`, `List-Unsubscribe`. Groups 1 to 3 are always kept whole; once
+  something does not fit, nothing of a lower priority is kept. The headers come in that order, so a reader that stops early
+  has read the authentication results first. The score is always computed on the whole evidence, before any cut.
+  Anything cut is named in `security.capped` `{reason: "size", resumable: false, cut: ["Received 9/27", "X-Spam-Report",
+  "links 1/80"]}`, with a warning.
 
 ## Sorting and drafts
 

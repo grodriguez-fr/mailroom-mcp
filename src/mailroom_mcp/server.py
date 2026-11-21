@@ -76,6 +76,7 @@ LATEST_BEFORE_DAYS = 365  # latest_before: how far back to look before the empty
 MAX_CHARS_DEFAULT = 8000
 MAX_CHARS_LIMIT = 100000
 RESPONSE_BUDGET = 7500   # compact JSON characters for the list of one page (messages or groups)
+SECURITY_BUDGET = 7500   # the same for the security object of read_message (phishing score, headers, links)
 SORT_FALLBACK_MAX = 2000  # without SORT, messages sorted by their date (the most recently received ones)
 
 
@@ -2292,22 +2293,20 @@ def fetch_text(M, uid: int, part, folder: str, hint: str, warnings: list) -> str
 
 def security_report(msg, markup: str | None, body: str, warnings: list) -> dict:
     """read_message(security=true): authentication headers, link targets and a phishing suspicion score (computed on
-    the whole evidence, before any cut). Links whose text shows another domain come first; what does not fit the
-    size budget is dropped and said in `capped`."""
+    the whole evidence, before any cut). What does not fit the size budget is dropped by priority (phishing block,
+    authentication headers, identity headers, flagged links, Received lines, other links, spam report) and named in
+    `capped`."""
     full = phishing.raw_headers(msg)
     headers, cut = phishing.auth_headers(msg, full)
-    links = sorted(phishing.extract_links(markup), key=lambda link: not link.get("mismatch")) if markup is not None else []
     signatures = phishing.dkim_signatures(msg)  # {d, s} only: the score needs the signing domain to tell an aligned DKIM
     evidence = {**full, "DKIM-Signature": signatures} if signatures else full
+    links, flagged = phishing.order_links(evidence, phishing.extract_links(markup)) if markup is not None else ([], 0)
     score = phishing.phishing_score(evidence, links, body, (phishing.header_values(msg, "Subject") or [""])[0])
-    report = {"phishing": score, "headers": headers}
+    headers, links, dropped = phishing.trim_evidence(score, headers, links, flagged, SECURITY_BUDGET)
+    report = {"phishing": score, "headers": headers, "links": links}
     if markup is None:
-        report["links"] = []
         warnings.append("No HTML part: no link targets to check (a plain text link is not listed).")
-    else:
-        report["links"] = fit(links, max(RESPONSE_BUDGET - json_size(headers) - json_size(score), 0)) if links else []
-        if len(report["links"]) < len(links):
-            cut.append(f"links {len(report['links'])}/{len(links)}")
+    cut += dropped
     if cut:
         report["capped"] = {"reason": "size", "resumable": False, "cut": cut}
         warnings.append("Security data was shortened to fit the size budget: see security.capped.")
