@@ -524,3 +524,213 @@ def test_score_is_pure_and_description_still_fits():
         assert phishing.phishing_score({"From": "a@example.org"}, [], "x")["level"] == "low"
     finally:
         socket.socket.connect = original
+
+
+# --- Second tuning pass: origin of the first hop, internal relays, display names ---
+# Fictional hosts only: .example domains and documentation addresses (192.0.2.x, 198.51.100.x, 203.0.113.x).
+
+def hop(line):
+    return ("Received", line + "; Fri, 21 Nov 2026 08:00:00 +0100")
+
+
+OWN_HOP = hop("from host.hosting.example by host.hosting.example with LMTP id ABC123")
+
+SCENARIOS = {
+    # a platform sending notifications through Mandrill: bare IP as helo, DKIM aligned on the From domain
+    "platform_bare_ip_aligned": dict(
+        sender="Collabhub <notifications@collabhub.example>", subject="Dana commented on your project", body="Dana commented.",
+        html=('<p>Dana commented on your project.</p>'
+              '<a href="https://mandrillapp.com/track/click/30001/app.collabhub.example?p=abc">app.collabhub.example/threads/9</a>'
+              '<a href="https://mandrillapp.com/track/unsub/30001/abc">Unsubscribe</a>'),
+        headers=[OWN_HOP, hop("from 198.51.100.45 (unknown [198.51.100.45]) by host.hosting.example with ESMTPS"),
+                 ("Return-Path", "<bounce@mandrillapp.com>"), *aligned_auth("collabhub.example")]),
+    # a bank's notification: internal hops on a private address, a container hostname as helo, DKIM aligned
+    "bank_internal_hops_aligned": dict(
+        sender="Bankco <noreply@bankco.example>", subject="Your transfer was executed", body="Your transfer of 120 euros was executed.",
+        html=('<p>Your transfer of 120 euros was executed.</p><a href="https://mabanque.bankco.example/accounts">Open my accounts</a>'
+              '<a href="https://mabanque.bankco.example/help">www.bankco.example</a>'),
+        headers=[OWN_HOP,
+                 hop("from relay.bankco.example (relay.bankco.example [198.51.100.52]) by host.hosting.example with ESMTPS"),
+                 hop("from 765765b0d442 ([10.225.0.128]) by relay.bankco.example (Postfix) with ESMTP id 4Xyz"),
+                 *aligned_auth("bankco.example")]),
+    # "Amazon" on an unrelated domain, sent from the third party's own machine, a link to an unknown domain
+    "fake_amazon_local_send": dict(
+        sender="Amazon <service@promo-abo.example>", subject="Merci pour votre abonnement",
+        body="Merci pour votre abonnement. Votre paiement a été refusé: mettez à jour votre carte bancaire sous 24 heures.",
+        html=('<p>Merci pour votre abonnement. Votre paiement a été refusé: mettez à jour votre carte bancaire sous 24 heures.</p>'
+              '<a href="https://renouvellement-prime.example/abo?id=1">Gérer mon abonnement</a>'),
+        headers=[OWN_HOP,
+                 hop("from mx.promo-abo.example (mx.promo-abo.example [203.0.113.40]) by host.hosting.example with esmtps"),
+                 hop("from localhost by mx.promo-abo.example ([127.0.0.1]) with ESMTP id 5")]),
+    # a generic title, localhost / 127.0.0.1 on the third party's machine, one link through a redirector
+    "trial_period_generic": dict(
+        sender="Service Client <contact@trial-hub.example>", subject="Votre période d'essai arrive à son terme",
+        body="Votre période d'essai arrive à son terme. Continuer",
+        html='<p>Votre période d\'essai arrive à son terme.</p><a href="https://share.google/AbC123">Continuer</a>',
+        headers=[OWN_HOP,
+                 hop("from mail.trial-hub.example (mail.trial-hub.example [203.0.113.41]) by host.hosting.example with esmtp"),
+                 hop("from localhost (localhost [127.0.0.1]) by mail.trial-hub.example (Postfix) with ESMTP id 7")]),
+}
+
+
+def scenario(monkeypatch, name, **changes):
+    spec = {**SCENARIOS[name], **changes}
+    return level_of(monkeypatch, spec["sender"], spec["html"], spec["headers"], subject=spec["subject"], body=spec["body"])
+
+
+def test_platform_with_a_bare_ip_helo_and_aligned_dkim_stays_low(monkeypatch):
+    result = scenario(monkeypatch, "platform_bare_ip_aligned")
+    assert result["level"] == "low" and result["score"] < 30
+    assert codes(result)["origin_mismatch"] == 5 and "198.51.100.45" in result["reasons"][0]["detail"] + result["reasons"][-1]["detail"]
+    unsigned = scenario(monkeypatch, "platform_bare_ip_aligned", headers=SCENARIOS["platform_bare_ip_aligned"]["headers"][:3])
+    assert codes(unsigned)["origin_mismatch"] == 15  # the same hop without a DKIM of the From domain
+
+
+def test_bank_notice_through_internal_hops_stays_low(monkeypatch):
+    result = scenario(monkeypatch, "bank_internal_hops_aligned")
+    assert result["level"] == "low" and "origin_mismatch" not in codes(result)
+    assert "display_mismatch" not in codes(result)  # www.bankco.example and mabanque.bankco.example are one site
+    unsigned = scenario(monkeypatch, "bank_internal_hops_aligned", headers=SCENARIOS["bank_internal_hops_aligned"]["headers"][:3])
+    assert unsigned["level"] in ("low", "medium") and "origin_mismatch" not in codes(unsigned)
+
+
+def test_internal_loopback_relay_of_a_signed_company_is_not_a_local_send(monkeypatch):
+    headers = [OWN_HOP, hop("from relay.bankco.example (relay.bankco.example [198.51.100.52]) by host.hosting.example with ESMTPS"),
+               hop("from localhost (localhost [127.0.0.1]) by relay.bankco.example (Postfix) with ESMTP id 4Xyz"),
+               *aligned_auth("bankco.example")]
+    result = level_of(monkeypatch, "Bankco <noreply@bankco.example>", "<p>Statement</p>", headers)
+    assert result["level"] == "low" and "origin_mismatch" not in codes(result)
+    unsigned = level_of(monkeypatch, "Bankco <noreply@bankco.example>", "<p>Statement</p>", headers[:3], uid=2)
+    assert codes(unsigned) == {"origin_mismatch": 25}  # the same hand-over without the company's signature
+
+
+def test_fake_amazon_sent_from_a_third_partys_machine_scores_high(monkeypatch):
+    result = scenario(monkeypatch, "fake_amazon_local_send")
+    assert result["level"] == "high" and result["score"] >= 60
+    assert codes(result) == {"display_name_brand_mismatch": 30, "origin_mismatch": 25, "link_domain_mismatch": 15, "urgency_payment": 12}
+    assert "'amazon'" in " ".join(r["detail"] for r in result["reasons"])
+
+
+def test_trial_period_notice_from_a_generic_title_is_at_least_medium(monkeypatch):
+    result = scenario(monkeypatch, "trial_period_generic")
+    assert result["level"] in ("medium", "high") and result["score"] >= 30
+    assert codes(result) == {"display_name_brand_mismatch": 30, "origin_mismatch": 25, "link_domain_mismatch": 15}  # high: 70
+    assert result["level"] == "high"
+
+
+def test_first_external_hop_skips_internal_hops_and_container_helos():
+    def origin(*lines, **extra):
+        return codes(phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Received": list(lines), **extra}, [], ""))
+    own = "from mx.shop.example (mx.shop.example [198.51.100.9]) by host.example"
+    for private in ("10.1.2.3", "172.16.5.4", "172.31.255.1", "192.168.0.7", "fd12:3456::1"):
+        assert origin(own, f"from relay ([{private}]) by mx.shop.example") == {}, private
+    # a loopback address is internal too (a hand-over on the receiving server is not judged at all)
+    assert origin("from localhost ([127.0.0.1]) by host.example") == {} and origin("from x ([::1]) by host.example") == {}
+    assert origin(own, "from relay ([::1]) by host.example") == {}
+    # a container hostname is internal, with a private or a public address
+    assert origin(own, "from 765765b0d442 ([10.225.0.128]) by mx.shop.example") == {}
+    assert origin("from 765765b0d442 (unknown [203.0.113.5]) by host.example") == {}
+    # the first external hop is the oldest one with a public address, whatever the internal ones before it say
+    assert origin("from [203.0.113.5] by host.example", "from 765765b0d442 ([10.225.0.128]) by relay") == {"origin_mismatch": 15}
+    assert origin("from localhost (helo=localhost) [203.0.113.5] by host.example",
+                  "from 765765b0d442 ([10.225.0.128]) by relay") == {"origin_mismatch": 35}
+    # 172.32.x.x is not private
+    assert origin("from [172.32.0.1] by host.example") == {"origin_mismatch": 15}
+
+
+def test_bare_ip_and_absent_helo_weigh_15_and_5_with_an_aligned_dkim():
+    signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
+    def origin(line, **extra):
+        return codes(phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Received": [line], **extra}, [], ""))
+    for line in ("from 203.0.113.5 by mx", "from [203.0.113.5] (unknown [203.0.113.5]) by mx", "from unknown (unknown [203.0.113.5]) by mx",
+                 "from [2001:db8::5] by mx", "from x (helo=[203.0.113.5]) [203.0.113.5] by mx"):
+        assert origin(line) == {"origin_mismatch": 15}, line
+        assert origin(line, **signed) == {"origin_mismatch": 5}, line
+    # localhost from a public address stays at 35, signed or not
+    for line in ("from localhost ([203.0.113.5]) by mx", "from [203.0.113.5] (helo=localhost) by mx"):
+        assert origin(line) == {"origin_mismatch": 35} and origin(line, **signed) == {"origin_mismatch": 35}
+    assert origin("from [203.0.113.5] (helo=localhost) by mx with ESMTPSA") == {}  # SMTP AUTH is still not judged
+
+
+def test_local_send_needs_a_third_party_server_a_claim_and_no_aligned_dkim():
+    chain = ["from mx.shop.example (mx.shop.example [203.0.113.40]) by host.example with esmtps",
+             "from localhost by mx.shop.example ([127.0.0.1]) with ESMTP"]
+    signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
+    def origin(sender, received=chain, **extra):
+        return codes(phishing.phishing_score({"From": sender, "Received": received, **extra}, [], ""))
+    assert origin("Shop <noreply@shop.example>") == {"origin_mismatch": 25}
+    assert origin("Shop <noreply@shop.example>", **signed) == {}                       # the company signed it: its own relay
+    assert origin("Camille <camille@perso.example>") == {}                              # a person, no company or brand claimed
+    assert origin("Shop <noreply@shop.example>", ["from localhost by host.example ([127.0.0.1])"]) == {}  # the receiving server itself
+    assert origin("Shop <noreply@shop.example>", ["from x by host.example", "from localhost by host.example ([127.0.0.1])"]) == {}
+    assert origin("Amazon <camille@perso.example>").get("origin_mismatch") == 25        # a brand in the display name is a claim
+
+
+def test_display_name_brand_weights_and_exceptions():
+    def named(sender, **extra):
+        return codes(phishing.phishing_score({"From": sender, **extra}, [], "")).get("display_name_brand_mismatch")
+    signed = lambda d: {"Authentication-Results": f"mx; dkim=pass header.d={d}; dmarc=pass", "DKIM-Signature": [{"d": d, "s": "k"}]}
+    assert named("Amazon <service@promo-abo.example>") == 30 and named("PayPal Support <help@secure-pay.example>") == 30
+    assert named("Mondial Relay <noreply@colis-info.example>") == 30 and named("Crédit Agricole <info@notif-ca.example>") == 30
+    assert named("Blockchain <hello@wallet-news.example>") == 30 and named("La Poste <contact@suivi-colis.example>") == 30
+    assert named("Amazon <x@gmail.com>") == 30  # even from a free webmail
+    assert named("Amazon <order-update@amazon.fr>") is None and named("Amazon <x@marketplace.amazon.co.uk>") is None
+    assert named("Mondial Relay <noreply@mondialrelay.fr>") is None and named("La Poste <noreply@laposte.fr>") is None
+    assert named("Assurance Maladie <noreply@ameli.fr>") is None and named("DHL Express <x@dhlparcel.example>") is None
+    assert named("Amazon <service@promo-abo.example>", **signed("promo-abo.example")) is None  # signed by the From domain
+    assert named("Free Mobile <contact@promo-mobile.example>") == 30 and named("Orange <x@promo.example>") == 30
+    assert named("Camille Free <camille@perso.example>") is None and named("Un orange pressé <x@jus.example>") is None
+    assert named("Camille <camille@perso.example>") is None and named("") is None
+
+
+def test_generic_service_title_weighs_15_alone_and_30_next_to_another_signal():
+    def named(sender, headers=None, links=(), text=""):
+        return codes(phishing.phishing_score({"From": sender, **(headers or {})}, list(links), text)).get("display_name_brand_mismatch")
+    off = [{"url": "https://clic.offres.example/", "domain": "clic.offres.example"}]
+    assert named("Service Client <contact@trial-hub.example>") == 15
+    assert named("Support <hello@trial-hub.example>") == 15 and named("Sécurité <alerts@trial-hub.example>") == 15
+    assert named("Customer Service <info@trial-hub.example>") == 15
+    # a link off the From domain or payment wording alone are too common to raise it
+    assert named("Service Client <contact@trial-hub.example>", links=off, text="Votre facture, règlement sous 48 heures") == 15
+    assert named("Service Client <contact@trial-hub.example>", {"X-Spam-Flag": "YES"}) == 30
+    assert named("Service Client <contact@trial-hub.example>", {"Authentication-Results": "mx; spf=fail"}) == 30
+    # backed by the address or by the company's own name: not a claim
+    assert named("Service Client <service@trial-hub.example>") is None and named("Support <support@trial-hub.example>") is None
+    assert named("Trialhub Support <hello@trial-hub.example>") is None
+    assert named("Service Client <contact@trial-hub.example>", {"Authentication-Results": "mx; dkim=pass header.d=trial-hub.example; dmarc=pass",
+                                                                "DKIM-Signature": [{"d": "trial-hub.example", "s": "k"}]}) is None
+
+
+def test_redirectors_are_off_domain_links_and_never_trusted():
+    for host in ("share.google", "bit.ly", "t.co", "tinyurl.com", "lnkd.in", "go.bit.ly"):
+        assert phishing.redirector(host) and not phishing.on_platform(host), host
+    assert phishing.on_platform("www.linkedin.com") and phishing.on_platform("click.mandrillapp.com") and not phishing.redirector("x.com")
+    one = [{"url": "https://share.google/abc", "domain": "share.google"}]
+    result = phishing.phishing_score({"From": "Shop <noreply@shop.example>"}, one, "")
+    assert codes(result) == {"link_domain_mismatch": 15}  # not 5: a shortener is not a known platform
+    crypto = phishing.phishing_score({"From": "Coinco <notif@coinco.example>"}, one, "Never share your seed phrase")
+    assert "crypto_transaction_lure" in codes(crypto)
+
+
+def test_sibling_subdomains_of_one_domain_are_not_a_display_mismatch():
+    def flagged(text, href):
+        return phishing.extract_links(f'<a href="{href}">{text}</a>')[0].get("mismatch", False)
+    assert not flagged("www.bankco.example", "https://mabanque.bankco.example/x")
+    assert not flagged("app.bankco.co.uk", "https://www.bankco.co.uk/x")
+    assert flagged("bankco.example", "https://bankco.example.evil.example/x") and flagged("www.bankco.example", "https://bankco-secure.example/x")
+    assert flagged("paypal.github.io", "https://evil.github.io/x")  # a shared host: sibling subdomains are strangers
+
+
+def test_internal_hosts_never_make_a_company_look_improvised(monkeypatch):
+    """The bank notification that scored 91: internal hops, container hostname, links on the bank's own domains."""
+    result = scenario(monkeypatch, "bank_internal_hops_aligned")
+    assert result["score"] <= 10
+
+
+def test_blockchain_impersonation_scores_high_with_the_brand_signal(monkeypatch):
+    html = ('<p>You have 13 (0.025 ETH) pending in your Wallet.</p>'
+            '<a href="https://wallet-notif.example/accept?id=7">Review Transaction &amp; Accept</a>')
+    result = level_of(monkeypatch, "Blockchain <notif@wallet-news.example>", html, [LOCALHOST_HOP],
+                      subject="Action Required: 13 (0.025 ETH) pending in your Wallet",
+                      body="You have 13 (0.025 ETH) pending in your Wallet. Review Transaction & Accept")
+    assert result["level"] == "high" and codes(result)["display_name_brand_mismatch"] == 30
