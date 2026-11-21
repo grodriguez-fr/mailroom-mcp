@@ -7,13 +7,15 @@ remote deployment: [docs/deployment.md](docs/deployment.md).
 - `src/mailroom_mcp/server.py`: tools and stdio transport (`mailroom-mcp`). `build()` registers the tools once
   for both transports.
 - `src/mailroom_mcp/remote.py`: HTTP transport, OAuth restricted to one Google account (`mailroom-mcp-http`).
+- `src/mailroom_mcp/phishing.py`: `read_message(security=true)`: authentication headers, link targets and the phishing score
+  `phishing_score` (pure text functions: never any network access).
 - `src/mailroom_mcp/config.py`: environment and accounts file (`MAIL_ACCOUNTS_FILE`), strict validation.
 - `src/mailroom_mcp/smtp.py`: SMTP submission for `send_draft`; every failure says whether the mail left.
 - `src/mailroom_mcp/google_oauth.py`: Gmail XOAUTH2 (refresh token exchange, in-memory access tokens);
   `src/mailroom_mcp/auth.py`: `mailroom-mcp-auth google`, the loopback authorization flow.
 - `tests/`: `test_server.py` (fake IMAP), `test_accounts.py` (several accounts, Gmail-like fake, XOAUTH2),
   `test_config.py`, `test_auth.py`, `test_remote.py` (HTTP and OAuth), `test_contract.py` (both transports),
-  `test_send.py` (`send_draft`, fake SMTP server).
+  `test_send.py` (`send_draft`, fake SMTP server), `test_phishing.py` (`read_message` security check).
 - `deploy/`: Docker Compose file and `.env.example`; `Dockerfile` at the root installs from `uv.lock`.
 
 ## Commands
@@ -36,3 +38,6 @@ MAIL_IMAP_HOST=… MAIL_USER=… uv run mailroom-mcp --check   # real login, lis
 - Compact output: every field costs context to every model using the server. Readable error messages.
 - Changing an output shape forces clients to reload the schema: say so in the change description.
 - Dependencies change through `pyproject.toml` and `uv lock`, never by hand in `uv.lock`.
+- The security check stays offline: no DKIM signature check, no ARC seal check, no DNS lookup, no link fetch. It
+  trusts only the receiving server's own `Authentication-Results` (decided after real-mail validation; reopen only
+  with mail it misses).

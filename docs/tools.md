@@ -19,6 +19,10 @@ single account it can be left out (a different name is an error). With several:
   deduplicated ignoring case. Mail to an alias is addressed to that account (`to_me`, the To check of
   `answered=false`, `to` left out of rows); mail from any account's user or alias is your own mail
   (`excluded_from_me`). `mailroom-mcp --check` prints the number of aliases of each account.
+- `auth_servers` (optional, per account; `MAIL_AUTH_SERVERS`, comma-separated, for the single account) lists the
+  authserv-ids of the receiving server whose `Authentication-Results` the phishing check trusts, besides the host of the
+  topmost `Received` line (see `security.auth`). Host names, lower case, deduplicated. A Gmail account (`google-oauth`, or
+  host `imap.gmail.com`) always trusts `mx.google.com`.
 - A search over several accounts keeps the single-account contract: one date-sorted list, exact pagination,
   size capping, `group_by` over the whole filter (groups are per account: the same sender in two accounts gives
   two groups), `latest_before`. `folders_excluded` becomes `{account: [folders]}`. An unreachable account, or
@@ -182,6 +186,92 @@ leaving a `[… N quoted lines removed …]` marker; `strip_quotes=false` gives 
 the cleaned text, `next_offset` the position in that text where the next page starts, to pass as `offset` (null
 at the end). It counts characters of the cleaned text, not of the raw message, and pages end on a paragraph:
 it can be below `max_chars` while more text follows.
+
+`security` (default false, so ordinary reads stay light) adds a `security` object to check a mail for phishing in
+the same call (a suspicion score, the evidence headers and the link targets), from the headers already fetched and, for links, the HTML part (downloaded only then, when the text
+part was chosen for the body). Nothing is fetched from the network: a link is never opened, resolved or followed.
+It comes with every page of a long text, so ask for it once.
+
+- `security.auth`: `receiver` when the receiving server wrote an `Authentication-Results` or a `Received-SPF` that the
+  score used, `unknown` otherwise (no such line, or only lines the sender could have written: then the mail is neither
+  authenticated nor failed, and no result of its headers is trusted, whatever `security.headers` shows). The receiving
+  server is the host named by `by` in the topmost `Received` line (nobody can write above it) or an `auth_servers`
+  entry. A result counts when its authserv-id is that server or on its organisational domain, and it sits above the
+  *entry line*: the lowest of the consecutive `Received` lines the receiver wrote, from the top (`by` is the receiver,
+  or a bare token above its first host line), where it accepted the message from outside. Everything under that line
+  was written by the sender and is never trusted, whatever its authserv-id says, so a sender that connects straight
+  to a shared host cannot add a line that looks like its own. Without a `Received` line of the receiver nothing counts.
+  For the `auth_servers` only (Gmail writes its results right under its own `Received` line), a result between the entry
+  line and the next `Received` line counts too. `ARC-Authentication-Results` is never used: its seal cannot be checked
+  without cryptography and DNS lookups, which the server does not do. The signatures are not checked either (a
+  deliberate choice: the check stays offline), so a host that writes no `Authentication-Results` gives `unknown`: the
+  check narrows what a sender can claim, it does not replace a verified DKIM.
+- `security.phishing`: `{score, level, reasons}`, a hint to look closer, never a verdict, computed without network
+  access from the whole evidence (before any size cut). `score` is 0-100 (the sum of the weights, capped), `level` is
+  `low` (< 30), `medium` (30-59) or `high` (>= 60), `reasons` is `[{code, detail, weight}]` by decreasing weight, the
+  `detail` a short English sentence with the value at fault. It only reports: nothing is moved, flagged or marked.
+
+  | code | weight | signal |
+  |---|---|---|
+  | `auth_fail` | dmarc fail 35, spf fail 25, dkim fail 20, spf softfail 10 (sum, max 45) | the receiving server's `Authentication-Results` (`security.auth`), `Received-SPF` for SPF when it has none; any other one is written by the sender and ignored |
+  | `spam_flag` | 30 flag/status "Yes" or score >= required; 25 score >= 5; 10 score >= 2 | the mail host's `X-Spam-Flag`, `X-Spam-Status`, `X-Spam-Score`, `X-Spam-Bar` |
+  | `origin_mismatch` | first external hop: 35 `localhost` helo; 15 bare IP or no helo (5 with an aligned DKIM); 25 local hand-over on a third party's server; + 25 / 15 / 5 for Reply-To / Return-Path (max 60) | the *first external hop* is the oldest `Received` line whose client has a public IP, whatever the From looks like (SMTP AUTH submissions excepted). A hop on a private or loopback address (10/8, 172.16/12, 192.168/16, 127/8, fc00::/7, ::1) or with a container hostname as helo (12 hex characters) is internal and never judged. Helo `localhost` from a public IP is 35 even with a signature; a bare IP (or no helo) is 15, or 5 when a DKIM signature of the From domain passed. The *local hand-over* (25) is a `localhost` / `127.0.0.1` hop on a server that is not the receiving one (a third party's own machine writing under the From's name) when the From claims a company or a brand and no aligned DKIM vouches for it; a signed company's internal relay is not one. Also, when the From is a company address (`noreply@`, `service@`..., or the display name carries the domain's name), `Return-Path` / `Reply-To` on another domain than the From (mailing platforms excepted): 25 on a free webmail, else 15, or 5 with an aligned DKIM |
+  | `link_domain_mismatch` | 15; 5 if the other links are all known sending / tracking domains or large sites | no `http(s)` link is on the From domain (subdomains count); not for free mail providers. Link shorteners and redirectors (`share.google`, `bit.ly`, `t.co`, `tinyurl.com`, `lnkd.in`...) are off-domain links, never known platforms |
+  | `lookalike_domain` | 35 brand word; 30 IDN only | a link's domain shares 5 letters in a row with the From domain's name without being it (`mondialrelay.fr` -> `ml-colis-relay.com`); generic words (`france`, `connect`, `service`, `login`...), the From domain, known sending / tracking domains and, with an aligned DKIM, domains holding the whole brand name (product sites) are excepted; or an IDN / `xn--` host |
+  | `display_mismatch` | 35 unknown destination; 10 if it is a known sending / tracking domain or the DKIM is aligned | a link whose text shows another URL (`mismatch`) |
+  | `display_name_brand_mismatch` | 30 known brand in the display name; 15 generic service title (30 next to any other signal but `link_domain_mismatch` / `urgency_payment`) | the display name holds a known brand (`Amazon`, `PayPal`, `Mondial Relay`, `La Poste`, `Assurance Maladie`, `Orange`, common French banks, `Blockchain`, `Coinbase`...) or a generic title (`Service Client`, `Support`, `Sécurité`, `Customer Service`) while the address domain does not carry the brand and no DKIM signature of the From domain passed. A title backed by the address (`support@` for `Support`) or by the company's own name (`Acme Support` from `acme.example`) is not a claim; `Free`, `Orange`, `UPS`, `CAF` only count at the start of the name |
+  | `crypto_transaction_lure` | 20 | wallet wording (`pending transaction`, `review and accept transaction`, `seed phrase`, `transaction en attente`, or two of `wallet`, `portefeuille`, `ETH`, `BTC`, `USDT`...) in the subject, text or a button, with a link outside the From domain and not a known platform |
+  | `template_placeholder` | 20 | unfilled `{prenom}`, `{{name}}`, `%FIRSTNAME%`, `*\|FNAME\|*`, `[[nom]]` in the text |
+  | `urgency_payment` | 6 per group, max 12 | urgency words (`urgent`, `sous 24 h`, `action required`...) and payment words (`paiement`, `IBAN`, `gift card`...), French and English |
+
+  An *aligned DKIM* is a `dkim=pass` (and no dmarc failure: `dmarc=none` is not one) in the receiving server's
+  `Authentication-Results` whose `header.d` (else the domain of `header.i`) is the From's own domain. The `d=` of the
+  `DKIM-Signature` headers never counts by itself (anyone can add a signature that claims the bank's domain); a passing
+  result that names no domain aligns the mail only when it carries exactly one signature, and that signature's `d=`. When it is aligned and the first hop is not `localhost`
+  from a public IP, `link_domain_mismatch`, `display_mismatch` and `lookalike_domain` are capped at 5 each (an IDN link
+  keeps its weight): a newsletter or a notification through a mailing platform (Brevo, Mailchimp, Intercom,
+  SparkPost...) triggers only those and stays `low`. The list of platforms and the weights live at the top of the score
+  section of `phishing.py`.
+
+  Attenuations that need that same alignment (or a passing relay signature) and a first hop that is not an improvised
+  `localhost`; without them nothing changes:
+  - *same brand, other suffix*: a link whose registrable name (the label before the public suffix: `fortuneo` in
+    `fortuneo.com`, `fortuneo.fr`, `fortuneo.co.uk`) is the From's counts as the sender's own: no `link_domain_mismatch`,
+    `lookalike_domain` or `display_mismatch` for it. Without an aligned DKIM it is a look-alike as before (anyone can
+    register `<brand>.xyz`).
+  - `origin_mismatch`, Return-Path leg: 0 at a known bounce / sending service (`worldline.com`, Brevo, SparkPost,
+    Mandrill, Amazon SES, Mailgun, SendGrid, `mcsv.net`, `rsgsv.net`, `bounces.google.com`, `googlegroups.com`...) with
+    an aligned DKIM; 0 behind a group relay (`List-Id`, `X-Google-Group-Id`, a Return-Path at a group service, or a
+    `Name via Platform` From) when a DKIM of the From domain, of the group service or of the named platform passed.
+  - `display_name_brand_mismatch`, in a mail with no `http(s)` link at all (HTML links or text): a generic title is 0 when
+    a DKIM passed; a known brand is 10 instead of 30 when a relay's own DKIM passed (`EDF via <platform>`).
+  - `display_mismatch` stays at 5 when the text shows the sender's own domain and the destination is a known sending /
+    tracking domain, and is dropped when the destination is the sender's own brand.
+- `security.headers`: `From`, `Reply-To`, `Return-Path`, `Sender`, `Received` (always a list: every line, in message
+  order, the receiving server's first), `Authentication-Results`, `ARC-Authentication-Results`, `Received-SPF`,
+  `X-Spam-Flag`, `X-Spam-Status`, `X-Spam-Score`, `X-Spam-Bar`, `X-Spam-Report` (cut at 300 characters),
+  `Message-ID` (raw text), `List-Unsubscribe`; absent ones are left out (`List-Id` and `X-Google-Group-Id` are read by the score only), a repeated one is a list. `DKIM-Signature` is a list of
+  `{d, s}` (signing domain and selector): the signature itself is never returned. Authentication-Results lines
+  other than the one your own server added are written by the sender: only the topmost is evidence.
+- `security.links`: the `<a href>` of the HTML body, deduplicated on URL and displayed text (`count` when repeated):
+  `{url, domain?, text?, count?, mismatch?, shown?, idn?, scheme?}`. `domain` is the real host of an `http(s)` URL,
+  lowercase; `mailto:`, `javascript:` and other schemes carry `scheme` and no domain. `mismatch: true` means the
+  text displays a URL or domain that is not the destination's, nor one of its parents, subdomains or siblings on the same
+  registrable domain (shared hosts such as `github.io` excepted), and `shown` is
+  that domain ("www.paypal.com" pointing to `evil.example`). `idn: true` marks a host written with non-ASCII or
+  `xn--` labels (look-alike characters). Flagged links come first. Links without target (`#…`, empty) and relative
+  links are left out; links of a mail without HTML part are not listed (a warning says so).
+- Size: a value is cut at 400 characters (`…`), `Received` at 20 lines, a URL at 300 characters (its `domain` stays
+  complete), and the whole `security` object at the size budget of a list page (7,500 characters). When something has to
+  go, the last in this list goes first: (1) the `phishing` block, (2) `Authentication-Results`,
+  `ARC-Authentication-Results`, `Received-SPF`, `X-Spam-Status` / `-Score` / `-Flag`, `DKIM-Signature`, (3) `From`,
+  `Reply-To`, `Return-Path`, `Sender`, `Message-ID`, (4) flagged links (`mismatch`, `idn`, look-alike of the sender's
+  name), (5) `Received` (the receiving server's line and the first external hop are kept, the middle goes first),
+  (6) the other links, (7) `X-Spam-Bar`, `X-Spam-Report`, `List-Unsubscribe`. Groups 1 to 3 are always kept whole; once
+  something does not fit, nothing of a lower priority is kept. The headers come in that order, so a reader that stops early
+  has read the authentication results first. The score is always computed on the whole evidence, before any cut.
+  Anything cut is named in `security.capped` `{reason: "size", resumable: false, cut: ["Received 9/27", "X-Spam-Report",
+  "links 1/80"]}`, with a warning.
 
 ## Sorting and drafts
 

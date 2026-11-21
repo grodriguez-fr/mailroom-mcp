@@ -23,6 +23,7 @@ DEFAULT_TIMEZONE = "UTC"
 GMAIL_HOST = "imap.gmail.com"
 DEFAULT_ACCOUNT = "default"  # name of the account configured through MAIL_IMAP_HOST and MAIL_USER
 ACCOUNT_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
+AUTHSERV_ID = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 EMAIL = re.compile(r"[^\s@<>()\[\],;:\"]+@[^\s@<>()\[\],;:\"]+\.[^\s@<>()\[\],;:\"]+")
 
 
@@ -31,7 +32,7 @@ class ConfigError(ToolError):
 
 
 # Single-account settings that the accounts file replaces (per-account keys there).
-SINGLE_ONLY = ("MAIL_ALIASES", "MAIL_SEND_ENABLED", "MAIL_SMTP_HOST", "MAIL_SMTP_PORT", "MAIL_SMTP_SECURITY")
+SINGLE_ONLY = ("MAIL_ALIASES", "MAIL_AUTH_SERVERS", "MAIL_SEND_ENABLED", "MAIL_SMTP_HOST", "MAIL_SMTP_PORT", "MAIL_SMTP_SECURITY")
 REQUIRED = {"MAIL_IMAP_HOST": "IMAP server host name, e.g. imap.example.org",
             "MAIL_USER": "mailbox login, e.g. me@example.org"}
 
@@ -79,6 +80,7 @@ def settings() -> dict:
     return {"host": env("MAIL_IMAP_HOST"), "port": int(port), "user": env("MAIL_USER"),
             "password_file": os.path.expanduser(env("MAIL_PASSWORD_FILE", DEFAULT_PASSWORD_FILE)),
             "aliases": parse_aliases("MAIL_ALIASES", aliases, env("MAIL_USER")), "timezone": zone(),
+            "auth_servers": parse_auth_servers("MAIL_AUTH_SERVERS", [a for a in env("MAIL_AUTH_SERVERS").split(",") if a.strip()]),
             "send": parse_switch("MAIL_SEND_ENABLED", env("MAIL_SEND_ENABLED"), False),
             "smtp": parse_smtp("MAIL_SMTP_*", smtp, env("MAIL_IMAP_HOST"), "password")}
 
@@ -140,6 +142,20 @@ def parse_aliases(where: str, value, user: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def parse_auth_servers(where: str, value) -> tuple[str, ...]:
+    """Validated authserv-ids: host names, lower case, without duplicates."""
+    if not isinstance(value, list):
+        raise ConfigError(f"{where}: expected a list of host names")
+    out = []
+    for item in value:
+        host = item.strip().lower().rstrip(".") if isinstance(item, str) else item
+        if not isinstance(host, str) or not AUTHSERV_ID.fullmatch(host):
+            raise ConfigError(f"{where}: expected host names such as mx.example.org, got {item!r}")
+        if host not in out:
+            out.append(host)
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class Account:
     name: str
@@ -151,10 +167,18 @@ class Account:
     client_secret_file: str | None = None
     refresh_token_file: str | None = None
     aliases: tuple[str, ...] = ()  # other addresses of the user: mail delivered here through them, or sent from them
+    auth_servers: tuple[str, ...] = ()  # authserv-ids whose Authentication-Results the phishing check trusts
     send: bool = False  # send_draft allowed (opt-in: "send": true, or MAIL_SEND_ENABLED for the single account)
     smtp_host: str = ""
     smtp_port: int = SMTP_PORTS["ssl"]
     smtp_security: str = "ssl"  # "ssl" (implicit TLS) or "starttls"
+
+    @property
+    def trusted_auth_servers(self) -> tuple[str, ...]:
+        """authserv-ids of the Authentication-Results written by this mailbox's receiving server, besides the host that
+        wrote the topmost Received line: the configured ones, plus mx.google.com for a Gmail account."""
+        gmail = self.auth == "google-oauth" or self.host.lower() == GMAIL_HOST
+        return self.auth_servers + (("mx.google.com",) if gmail and "mx.google.com" not in self.auth_servers else ())
 
     @property
     def addresses(self) -> tuple[str, ...]:
@@ -168,7 +192,7 @@ class Account:
 
 
 AUTH_KEYS = {"password": {"password_file"}, "google-oauth": {"client_secret_file", "refresh_token_file"}}
-ACCOUNT_KEYS = {"name", "host", "port", "user", "auth", "aliases", "send", "smtp"}
+ACCOUNT_KEYS = {"name", "host", "port", "user", "auth", "aliases", "auth_servers", "send", "smtp"}
 
 
 def _keys(where: str, entry: dict, allowed: set[str], required: set[str]):
@@ -232,11 +256,12 @@ def parse_accounts(data, source: str, base: str) -> list[Account]:
             raise ConfigError(f"{where}: port must be a number between 1 and 65535, got {port!r}")
         files = {key: _path(f"{where}: auth", auth[key], key, base) for key in AUTH_KEYS[kind]}
         aliases = parse_aliases(f"{where}: aliases", entry.get("aliases", []), user)
+        auth_servers = parse_auth_servers(f"{where}: auth_servers", entry.get("auth_servers", []))
         send = entry.get("send", False)
         if not isinstance(send, bool):
             raise ConfigError(f"{where}: send must be true or false, got {send!r}")
         smtp_host, smtp_port, smtp_security = parse_smtp(where, entry.get("smtp", {}), host, kind)
-        out.append(Account(name=name, host=host, port=port, user=user, auth=kind, aliases=aliases, send=send,
+        out.append(Account(name=name, host=host, port=port, user=user, auth=kind, aliases=aliases, auth_servers=auth_servers, send=send,
                            smtp_host=smtp_host, smtp_port=smtp_port, smtp_security=smtp_security, **files))
     return out
 
@@ -263,7 +288,7 @@ def accounts() -> list[Account]:
         smtp_host, smtp_port, smtp_security = cfg["smtp"]
         return [Account(name=DEFAULT_ACCOUNT, host=cfg["host"], port=cfg["port"], user=cfg["user"],
                         auth="password", password_file=cfg["password_file"], aliases=cfg["aliases"],
-                        send=cfg["send"], smtp_host=smtp_host, smtp_port=smtp_port, smtp_security=smtp_security)]
+                        auth_servers=cfg["auth_servers"], send=cfg["send"], smtp_host=smtp_host, smtp_port=smtp_port, smtp_security=smtp_security)]
     conflicting = [name for name in (*REQUIRED, *SINGLE_ONLY) if env(name)]
     if conflicting:
         raise ConfigError(f"MAIL_ACCOUNTS_FILE is set: remove {' and '.join(conflicting)}, the accounts file "

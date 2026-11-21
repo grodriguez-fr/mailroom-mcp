@@ -27,9 +27,11 @@ ATTACHMENT_STRUCTURE = (
 
 def mk(uid, subject, sender="Alice <alice@example.org>", date="Tue, 20 Oct 2026 10:00:00 +0000", body="Bonjour",
        flags=(), internal=None, attachment=False, structure=None, to="me@example.org", html=None,
-       message_id=None):
+       message_id=None, headers=()):
     msg = EmailMessage()
     msg["From"], msg["To"], msg["Subject"] = sender, to, subject
+    for name, value in headers:  # extra headers, in order; a name may repeat (Received)
+        msg[name] = value
     if date:
         msg["Date"] = date
     if message_id:
@@ -357,7 +359,7 @@ def mail_env(monkeypatch):
     monkeypatch.setenv("MAIL_IMAP_HOST", "imap.example.org")
     monkeypatch.setenv("MAIL_USER", "me@example.org")
     monkeypatch.setenv("MAIL_TIMEZONE", "Europe/Paris")
-    for name in ("MAIL_IMAP_PORT", "MAIL_PASSWORD_FILE", "MAIL_ALIASES", "MAIL_SEND_ENABLED", "MAIL_SMTP_HOST",
+    for name in ("MAIL_IMAP_PORT", "MAIL_PASSWORD_FILE", "MAIL_ALIASES", "MAIL_AUTH_SERVERS", "MAIL_SEND_ENABLED", "MAIL_SMTP_HOST",
                  "MAIL_SMTP_PORT", "MAIL_SMTP_SECURITY", "MAIL_SEND_LIMIT_PER_HOUR"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(server, "CONFIRMATIONS", server.Confirmations())  # send_draft state, per test
