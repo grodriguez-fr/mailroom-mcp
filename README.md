@@ -76,7 +76,7 @@ Every tool takes an optional `account`; searches cover all accounts by default.
 
 `list_folders`, `search_messages` (one folder, several or the whole mailbox; unread, awaiting your reply,
 automated mail apart, by sender…),
-`read_message` (clean text, attachments listed; `security=true` adds authentication headers and real link targets to check for phishing), `move_messages`, `set_flags`, `create_folder`, `save_draft`.
+`read_message` (clean text, attachments listed; `security=true` adds a phishing suspicion score with its reasons, authentication headers and real link targets; score only, nothing is moved or marked), `move_messages`, `set_flags`, `create_folder`, `save_draft`.
 Drafts can be sent with `send_draft` after your explicit approval (two steps: a preview, then a confirmation).
 Details: [docs/tools.md](docs/tools.md).
 

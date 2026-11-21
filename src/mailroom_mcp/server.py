@@ -2290,17 +2290,20 @@ def fetch_text(M, uid: int, part, folder: str, hint: str, warnings: list) -> str
     return decode_part(raw, part)
 
 
-def security_report(msg, markup: str | None, warnings: list) -> dict:
-    """read_message(security=true): authentication headers and link targets. Links whose text shows another
-    domain come first; what does not fit the size budget is dropped and said in `capped`."""
-    headers, cut = phishing.auth_headers(msg)
-    report = {"headers": headers}
+def security_report(msg, markup: str | None, body: str, warnings: list) -> dict:
+    """read_message(security=true): authentication headers, link targets and a phishing suspicion score (computed on
+    the whole evidence, before any cut). Links whose text shows another domain come first; what does not fit the
+    size budget is dropped and said in `capped`."""
+    full = phishing.raw_headers(msg)
+    headers, cut = phishing.auth_headers(msg, full)
+    links = sorted(phishing.extract_links(markup), key=lambda link: not link.get("mismatch")) if markup is not None else []
+    score = phishing.phishing_score(full, links, body)
+    report = {"phishing": score, "headers": headers}
     if markup is None:
         report["links"] = []
         warnings.append("No HTML part: no link targets to check (a plain text link is not listed).")
     else:
-        links = sorted(phishing.extract_links(markup), key=lambda link: not link.get("mismatch"))
-        report["links"] = fit(links, max(RESPONSE_BUDGET - json_size(headers), 0)) if links else []
+        report["links"] = fit(links, max(RESPONSE_BUDGET - json_size(headers) - json_size(score), 0)) if links else []
         if len(report["links"]) < len(links):
             cut.append(f"links {len(report['links'])}/{len(links)}")
     if cut:
@@ -2315,10 +2318,10 @@ def read_message(
     offset: Annotated[int, Field(ge=0, description="next_offset of the previous page.")] = 0,
     max_chars: Annotated[int, Field(ge=1, le=MAX_CHARS_LIMIT)] = MAX_CHARS_DEFAULT,
     strip_quotes: Annotated[bool, Field(description="Removes quoted thread and disclaimers.")] = True,
-    security: Annotated[bool, Field(description="Adds authentication headers and real link targets (phishing check).")] = False,
+    security: Annotated[bool, Field(description="Adds authentication headers, real link targets and a phishing score with reasons.")] = False,
     account: AccountName = None,
 ) -> dict:
-    """Reads a mail without marking it read: headers, text without the quoted thread (strip_quotes), attachments (inline images only counted). security:true adds authentication headers and link domains (mismatch: text shows another), never opened. A uid is only valid in the folder it came from: pass the account, folder and uid of a search row together. Long text: call again with offset=next_offset (same strip_quotes): a position in the cleaned text (pages end on a paragraph, quotes removed), not in the raw mail, so it can be below max_chars; null: the end. Example: {"folder":"INBOX","uid":4512}"""
+    """Reads a mail without marking it read: headers, text without the quoted thread (strip_quotes), attachments (inline images only counted). security:true adds a phishing score with reasons, auth headers and link domains (mismatch: text shows another), never opened. A uid is only valid in the folder it came from: pass the account, folder and uid of a search row together. Long text: call again with offset=next_offset (same strip_quotes): a position in the cleaned text, not the raw mail (pages end on a paragraph, so it can be below max_chars); null: the end. Example: {"folder":"INBOX","uid":4512}"""
     _int_arg(uid, "uid", 1)
     _int_arg(offset, "offset", 0)
     _int_arg(max_chars, "max_chars", 1, MAX_CHARS_LIMIT)
@@ -2389,7 +2392,7 @@ def read_message(
     if inline:
         out["inline_images"] = inline
     if security:
-        out["security"] = security_report(msg, markup, warnings)
+        out["security"] = security_report(msg, markup, body, warnings)
     if late:
         warnings.append(late)
     if warnings:

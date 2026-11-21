@@ -5,6 +5,7 @@ import json
 import socket
 
 import pytest
+from test_contract import stdio_tools
 from test_server import FakeIMAP, install, mail_env, mk  # noqa: F401  (autouse fixture)
 
 from mailroom_mcp import phishing, server
@@ -197,7 +198,184 @@ def test_mismatch_detection_unit():
 
 
 def test_security_description_stays_within_the_budget_and_schema_is_strict():
-    from test_contract import stdio_tools
     tool = stdio_tools()["read_message"]
     assert tool["inputSchema"]["properties"]["security"]["type"] == "boolean" and "security" not in tool["inputSchema"].get("required", [])
     assert tool["inputSchema"]["additionalProperties"] is False and len(tool["description"]) <= 600
+
+
+# --- phishing_score ---
+# Fictional hosts only (.example, documentation addresses), except the brand names being imitated.
+
+PARCEL_HEADERS = [
+    ("Return-Path", "<noreply@mondialrelay.fr>"),
+    ("Received", "from host.hosting.example by host.hosting.example with LMTP id ABC123 (Exim 4.100.1); Fri, 21 Nov 2026 08:00:03 +0100"),
+    ("Received", "from [203.0.113.64] (port=43738 helo=localhost) by host.hosting.example with esmtp (Exim 4.100.1) "
+                 "(envelope-from <noreply@mondialrelay.fr>) id 1vMabc-000xyz-1Q; Fri, 21 Nov 2026 08:00:02 +0100"),
+    ("X-Spam-Status", "No, score=1.2 required=5.0 tests=HTML_MESSAGE,MISSING_MID autolearn=no"),
+    ("X-Spam-Report", "Content analysis details: (1.2 points, 5.0 required) " + "pts rule name description " * 30),
+]
+PARCEL_HTML = '<p>Bonjour {prenom} {nom},</p><p>Votre colis est disponible.</p><a href="https://ml-colis-relay.example/">Gérer ma livraison</a>'
+PARCEL_TEXT = "Bonjour {prenom} {nom}, votre colis est disponible. Gérer ma livraison"
+
+NEWSLETTER_HEADERS = [
+    ("Return-Path", "<bounce-1234@bnc.sendibt3.com>"),
+    ("Received", "from mail-out.sendibm3.com (mail-out.sendibm3.com [198.51.100.20]) by mx.example.org with ESMTPS; Fri, 21 Nov 2026 07:00:00 +0100"),
+    ("Received", "from [10.1.2.3] (unknown [10.1.2.3]) by mail-out.sendibm3.com with SMTP; Fri, 21 Nov 2026 06:59:58 +0100"),
+    ("Authentication-Results", "mx.example.org; spf=pass smtp.mailfrom=bnc.sendibt3.com; dkim=pass header.d=marque.fr; dmarc=pass header.from=marque.fr"),
+    ("DKIM-Signature", "v=1; a=rsa-sha256; d=marque.fr; s=mail; h=from:to:subject; bh=Zm9v; b=QUFB"),
+    ("Reply-To", "Marque <contact@marque.fr>"),
+    ("List-Unsubscribe", "<https://r.sendibt3.com/u/abc>, <mailto:unsub@marque.fr>"),
+]
+NEWSLETTER_HTML = ('<p>Nos soldes: dernières heures pour en profiter.</p>'
+                   '<a href="https://3a1b.r.sendibt3.com/tr/cl/aaa">www.marque.fr</a>'
+                   '<a href="https://marque.us1.list-manage.com/track/click?u=1">Voir la collection</a>'
+                   '<a href="https://r.sendibt3.com/u/abc">Se désinscrire</a>')
+
+
+def score_of(monkeypatch, message, uid=1, folder="INBOX"):
+    install(monkeypatch, FakeIMAP({folder: {"flags": "", "messages": [message]}}))
+    return server.read_message(folder, uid, security=True)["security"]["phishing"]
+
+
+def codes(result):
+    return {r["code"]: r["weight"] for r in result["reasons"]}
+
+
+def parcel(headers=PARCEL_HEADERS, html=PARCEL_HTML, body=PARCEL_TEXT, uid=1):
+    return mk(uid, "Votre colis est arrivé", sender="Mondial Relay <noreply@mondialrelay.fr>", body=body, html=html,
+              headers=headers)
+
+
+def test_the_real_parcel_scam_scores_high(monkeypatch):
+    result = score_of(monkeypatch, parcel())
+    assert result["level"] == "high" and result["score"] == 95
+    assert codes(result) == {"lookalike_domain": 35, "origin_mismatch": 25, "template_placeholder": 20, "link_domain_mismatch": 15}
+    assert [r["weight"] for r in result["reasons"]] == sorted((r["weight"] for r in result["reasons"]), reverse=True)
+    details = " | ".join(r["detail"] for r in result["reasons"])
+    assert "ml-colis-relay.example" in details and "helo is 'localhost'" in details and "203.0.113.64" in details
+    assert "{prenom}" in details
+
+
+def test_newsletter_through_a_mailing_platform_stays_low(monkeypatch):
+    m = mk(2, "Soldes", sender="Marque <newsletter@marque.fr>", body="Soldes: dernières heures. www.marque.fr", html=NEWSLETTER_HTML,
+           headers=NEWSLETTER_HEADERS)
+    result = score_of(monkeypatch, m, 2)
+    assert result["level"] == "low" and result["score"] == 15
+    assert codes(result) == {"display_mismatch": 10, "link_domain_mismatch": 5}
+
+
+def test_personal_mail_without_link_scores_zero(monkeypatch):
+    m = mk(3, "Samedi", sender="Camille <camille@example.org>", body="Salut, on se voit samedi ? Tu peux me faire un virement pour le resto ?",
+           headers=[("Received", "from [192.168.1.20] (unknown [203.0.113.80]) by mx.example.org with ESMTPSA; Fri, 21 Nov 2026 09:00:00 +0100")])
+    result = score_of(monkeypatch, m, 3)
+    assert result["level"] == "low" and result["score"] == 6 and codes(result) == {"urgency_payment": 6}
+
+
+def test_plausible_medium_case(monkeypatch):
+    html = '<p>Votre facture est disponible, règlement sous 48 heures.</p><a href="https://clic.offres-du-jour.example/x?id=9">Voir ma facture</a>'
+    m = mk(4, "Votre facture", sender="Service client <service@bigshop.example>", body="Votre facture est disponible, règlement sous 48 heures.",
+           html=html, headers=[("Reply-To", "service.bigshop@freepost.example"), ("X-Spam-Status", "No, score=2.4 required=5.0 tests=HTML_MESSAGE")])
+    result = score_of(monkeypatch, m, 4)
+    assert result["level"] == "medium" and 30 <= result["score"] < 60
+    assert {"link_domain_mismatch", "origin_mismatch", "urgency_payment", "spam_flag"} <= set(codes(result))
+
+
+def test_authentication_failures_and_spam_verdict():
+    score = phishing.phishing_score(
+        {"From": "Bank <alerts@bank.example>", "Authentication-Results": "mx.example.org; spf=fail; dkim=fail; dmarc=fail",
+         "X-Spam-Flag": "YES", "X-Spam-Score": "9.1"}, [], "")
+    assert codes(score) == {"auth_fail": 45, "spam_flag": 30} and score["level"] == "high"
+    # only the topmost Authentication-Results counts: a later one is written by the sender
+    forged = phishing.phishing_score({"From": "a@bank.example", "Authentication-Results": ["mx.example.org; spf=pass", "x; spf=fail dmarc=fail"]}, [], "")
+    assert forged["score"] == 0
+    soft = phishing.phishing_score({"From": "a@bank.example", "Received-SPF": "softfail (domain does not designate)"}, [], "")
+    assert codes(soft) == {"auth_fail": 10}
+    assert phishing.phishing_score({"X-Spam-Bar": "++++++"}, [], "")["reasons"][0]["weight"] == 25
+
+
+def test_score_is_capped_at_100():
+    links = [{"url": "https://bank-secure.example/", "domain": "bank-secure.example", "mismatch": True, "shown": "bank.example", "idn": True}]
+    headers = {"From": "Bank <alerts@bank.example>", "Authentication-Results": "x; spf=fail; dmarc=fail", "X-Spam-Flag": "YES",
+               "Received": ["from [203.0.113.9] (helo=localhost) by mx"]}
+    result = phishing.phishing_score(headers, links, "Urgent: {{name}}, paiement sous 24 heures")
+    assert result["score"] == 100 and sum(r["weight"] for r in result["reasons"]) > 100
+
+
+def test_lookalike_and_alignment_rules():
+    def lookalike(host, frm="Mondial Relay <noreply@mondialrelay.fr>"):
+        link = {"url": f"https://{host}/", "domain": host}
+        return "lookalike_domain" in codes(phishing.phishing_score({"From": frm}, [link], ""))
+    assert lookalike("ml-colis-relay.example") and lookalike("mondialetransporte.example")
+    assert lookalike("mondialrelay.fr.verify-colis.example")
+    assert not lookalike("www.mondialrelay.fr") and not lookalike("click.mondialrelay.fr") and not lookalike("sendibt3.com")
+    assert not lookalike("france-travail.example", "France Connect <noreply@franceconnect.fr>")  # a generic word proves nothing
+    assert not lookalike("ml-colis-relay.example", "Camille <camille@gmail.com>")  # not a company address
+    idn = phishing.phishing_score({"From": "a@example.org"}, [{"url": "https://xn--mondilrelay-n6a.example/", "domain": "xn--mondilrelay-n6a.example", "idn": True}], "")
+    assert codes(idn)["lookalike_domain"] == 30
+    aligned = phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Return-Path": "<bounce@mail.shop.example>"}, [], "")
+    assert aligned["score"] == 0
+    other = phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Return-Path": "<x@elsewhere.example>"}, [], "")
+    assert codes(other) == {"origin_mismatch": 15}
+
+
+def test_first_hop_judges_the_oldest_received_and_only_outside_clients():
+    def hop(received, **extra):
+        return codes(phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Received": received, **extra}, [], ""))
+    assert "origin_mismatch" in hop(["from mx by me", "from [203.0.113.5] by mx with esmtp"])
+    assert "origin_mismatch" in hop(["from 203.0.113.5 by mx"])
+    assert "origin_mismatch" not in hop(["from localhost (localhost [127.0.0.1]) by mx"])  # internal hand-over
+    assert "origin_mismatch" not in hop(["from out.shop.example (out.shop.example [203.0.113.5]) by mx"])
+    assert "origin_mismatch" not in hop(["by 2002:a05:6a00 with SMTP id x; Fri"])  # no "from" clause
+    signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
+    assert "origin_mismatch" not in hop(["from [203.0.113.5] (helo=localhost) by mx"], **signed)  # authenticated: not improvised
+
+
+def test_placeholders_and_keywords_unit():
+    def text_codes(text):
+        return codes(phishing.phishing_score({}, [], text))
+    for text in ("Bonjour {prenom}", "Dear {{ first_name }}", "Hello %FIRSTNAME%", "Hi *|FNAME|*", "Cher [[nom]]"):
+        assert text_codes(text) == {"template_placeholder": 20}, text
+    for text in ("Bonjour Camille", "function() { return 1 }", "100%off", "a {b} c", "%20%2F"):
+        assert "template_placeholder" not in text_codes(text), text
+    assert text_codes("URGENT: régler la facture impayée") == {"urgency_payment": 12}
+    assert text_codes("Final notice: update your payment") == {"urgency_payment": 12}
+    assert text_codes("Bonne journée") == {}
+
+
+def test_reply_to_and_message_id_come_back_whatever_their_form(monkeypatch):
+    raw = ("From: Shop <noreply@shop.example>\nTo: me@example.org\nSubject: Hi\nreply-to: Société <ventes@shop.example>\n"
+           "message-id: <part one@shop.example>\nContent-Type: text/plain; charset=utf-8\n\nBonjour").encode()
+    m = mk(6, "Hi")
+    m["raw"] = raw + b"\n"
+    install(monkeypatch, FakeIMAP({"INBOX": {"flags": "", "messages": [m]}}))
+    result = server.read_message("INBOX", 6, security=True)
+    headers = result["security"]["headers"]
+    assert headers["Reply-To"] == "Société <ventes@shop.example>" and result["reply_to"] == "Société <ventes@shop.example>"
+    assert headers["Message-ID"] == "<part one@shop.example>"  # the parsed form would have stopped at "<part"
+    assert "Message-ID" not in server.read_message("INBOX", 6)  # only the security view carries it
+    json.dumps(result, ensure_ascii=False).encode("utf-8")
+
+
+def test_spam_headers_are_returned_and_the_report_is_shortened(monkeypatch):
+    install(monkeypatch, FakeIMAP({"INBOX": {"flags": "", "messages": [parcel()]}}))
+    security = server.read_message("INBOX", 1, security=True)["security"]
+    headers = security["headers"]
+    assert headers["X-Spam-Status"].startswith("No, score=1.2") and len(headers["X-Spam-Report"]) == 300
+    assert "X-Spam-Report (text)" in security["capped"]["cut"]
+    assert list(security)[:2] == ["phishing", "headers"]
+
+
+def test_score_reads_the_whole_evidence_even_when_output_is_cut(monkeypatch):
+    headers = [("Authentication-Results", "mx.example.org; " + "dkim=pass header.d=a.example; " * 30 + "spf=fail dmarc=fail")]
+    result = score_of(monkeypatch, mk(7, "Big", sender="a@bank.example", headers=headers, html="<p>x</p>"), 7)
+    assert codes(result)["auth_fail"] == 45 and "spf=fail" in result["reasons"][0]["detail"]  # the failures sit past the 400-character cut
+
+
+def test_score_is_pure_and_description_still_fits():
+    assert len(stdio_tools()["read_message"]["description"]) <= 600
+    original = socket.socket.connect
+    try:
+        socket.socket.connect = lambda *a, **k: (_ for _ in ()).throw(AssertionError("network"))
+        assert phishing.phishing_score({"From": "a@example.org"}, [], "x")["level"] == "low"
+    finally:
+        socket.socket.connect = original

@@ -7,8 +7,8 @@ remote deployment: [docs/deployment.md](docs/deployment.md).
 - `src/mailroom_mcp/server.py`: tools and stdio transport (`mailroom-mcp`). `build()` registers the tools once
   for both transports.
 - `src/mailroom_mcp/remote.py`: HTTP transport, OAuth restricted to one Google account (`mailroom-mcp-http`).
-- `src/mailroom_mcp/phishing.py`: `read_message(security=true)`: authentication headers and link targets (pure text
-  functions: never any network access).
+- `src/mailroom_mcp/phishing.py`: `read_message(security=true)`: authentication headers, link targets and the phishing score
+  `phishing_score` (pure text functions: never any network access).
 - `src/mailroom_mcp/config.py`: environment and accounts file (`MAIL_ACCOUNTS_FILE`), strict validation.
 - `src/mailroom_mcp/smtp.py`: SMTP submission for `send_draft`; every failure says whether the mail left.
 - `src/mailroom_mcp/google_oauth.py`: Gmail XOAUTH2 (refresh token exchange, in-memory access tokens);

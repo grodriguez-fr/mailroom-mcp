@@ -1,8 +1,10 @@
-"""Evidence for a phishing check, read from a message already fetched: authentication headers and the real
-destination of the links of its HTML body. Pure functions on text: nothing here opens a connection, and a link
-is never followed."""
+"""Evidence for a phishing check, read from a message already fetched: authentication headers, the real
+destination of the links of its HTML body, and a suspicion score built from both. Pure functions on text:
+nothing here opens a connection, and a link is never followed."""
 
+import ipaddress
 import re
+from email.utils import getaddresses
 from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
@@ -13,7 +15,10 @@ LINK_TEXT_MAX = 80       # characters of the text shown for a link
 
 # Headers kept as text, in this order; each one may appear several times.
 HEADERS = ("From", "Reply-To", "Return-Path", "Sender", "Received", "Authentication-Results",
-           "ARC-Authentication-Results", "Received-SPF", "Message-ID", "List-Unsubscribe")
+           "ARC-Authentication-Results", "Received-SPF", "X-Spam-Flag", "X-Spam-Status", "X-Spam-Score", "X-Spam-Bar",
+           "X-Spam-Report", "Message-ID", "List-Unsubscribe")
+LONG_HEADERS = {"X-Spam-Report": 300}   # verbose by nature: shortened harder than VALUE_MAX
+RAW_HEADERS = {"Message-ID"}            # the parsed form stops at the first malformed character: keep the raw text
 
 
 def unfold(value: str) -> str:
@@ -46,21 +51,32 @@ def cut(value: str, size: int) -> str:
     return value if len(value) <= size else value[:size - 1].rstrip() + "…"
 
 
-def auth_headers(msg) -> tuple[dict, list[str]]:
+def raw_headers(msg) -> dict:
+    """{header: value or [values]}, whole values: the evidence the score reads. Absent headers are left out."""
+    out = {}
+    for name in HEADERS:
+        if name in RAW_HEADERS:
+            values = [unfold(str(v)) for k, v in msg.raw_items() if k.lower() == name.lower()]
+        else:
+            values = header_values(msg, name)
+        if values:
+            out[name] = values[0] if len(values) == 1 and name != "Received" else values  # Received: always a list
+    return out
+
+
+def auth_headers(msg, full: dict | None = None) -> tuple[dict, list[str]]:
     """({header: value or [values]}, what was shortened). A header that is absent is left out."""
     out, shortened = {}, []
-    for name in HEADERS:
-        values = header_values(msg, name)
-        if not values:
-            continue
+    for name, value in (full if full is not None else raw_headers(msg)).items():
+        values = [value] if isinstance(value, str) else list(value)
         if name == "Received" and len(values) > RECEIVED_MAX:
             shortened.append(f"Received {RECEIVED_MAX}/{len(values)}")
             values = values[:RECEIVED_MAX]
-        long = [v for v in values if len(v) > VALUE_MAX]
-        if long:
+        size = LONG_HEADERS.get(name, VALUE_MAX)
+        if any(len(v) > size for v in values):
             shortened.append(f"{name} (text)")
-        values = [cut(v, VALUE_MAX) for v in values]
-        out[name] = values[0] if len(values) == 1 and name != "Received" else values  # Received: always a list
+        values = [cut(v, size) for v in values]
+        out[name] = values[0] if isinstance(value, str) else values
     signatures = dkim_signatures(msg)
     if signatures:
         out["DKIM-Signature"] = signatures
@@ -198,3 +214,328 @@ def extract_links(markup: str) -> list[dict]:
             entry["idn"] = True
         seen[key] = entry
     return list(seen.values())
+
+
+# --- Suspicion score ---
+#
+# phishing_score() adds up weighted signals, capped at 100. A signal is evidence, not proof: weights are chosen so
+# that no single weak signal reaches "medium", and a message needs several independent ones (or one strong one with
+# company) to reach "high". Newsletters sent through a mailing platform trigger the weak signals legitimately, so
+# those are attenuated when the destination is a known platform.
+#
+#   code                   weight                                   what it means
+#   auth_fail              dmarc 35, spf 25, dkim 20, softfail 10   topmost Authentication-Results / Received-SPF
+#                          (sum, max 45)                            say the sender is not who it claims
+#   spam_flag              30 (flag / status "Yes", score>=required) the host's own antispam verdict
+#                          25 (score >= 5), 10 (score >= 2)
+#   origin_mismatch        25 first external hop with helo localhost / bare IP,
+#                          +15 Return-Path or Reply-To not aligned (max 40)   the From claims a brand, the path does not
+#   link_domain_mismatch   15 (5 if every other link is a known platform)    no link on the From domain
+#   lookalike_domain       35 brand word in another domain, 30 IDN only       a link imitates the sender's brand
+#   display_mismatch       35 (10 when the destination is a known platform)   the text shows another URL
+#   template_placeholder   20                                                 {prenom}, {{name}}, %FIRSTNAME% unfilled
+#   urgency_payment        6 per group (urgency, payment), max 12             pressure and money words, FR/EN
+#
+# Levels: score < 30 "low", 30..59 "medium", >= 60 "high".
+LEVEL_MEDIUM, LEVEL_HIGH = 30, 60
+BODY_SCAN_MAX = 30000        # characters of the body read for placeholders and keywords
+
+# Platforms that send and track mail for others, and large sites a newsletter links to. Never shorteners (bit.ly...):
+# phishers use those too.
+PLATFORMS = (
+    "sendibt1.com", "sendibt2.com", "sendibt3.com", "sendibm1.com", "sendibm2.com", "sendibm3.com", "sendinblue.com",
+    "brevo.com", "list-manage.com", "mailchimp.com", "mcsv.net", "mandrillapp.com", "sendgrid.net", "sendgrid.com",
+    "amazonses.com", "awstrack.me", "mailjet.com", "mjt.lu", "hubspotemail.net", "hs-sites.com", "hubspot.com",
+    "constantcontact.com", "rs6.net", "campaign-archive.com", "klaviyo.com", "klaviyomail.com", "sparkpostmail.com",
+    "customeriomail.com", "mailgun.org", "mailgun.net", "mlsend.com", "mailerlite.com", "getresponse.com",
+    "createsend.com", "emltrk.com", "cm-sender.net", "mailkit.eu", "sarbacane.com", "mailpv.net", "ymlp.com",
+    "facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "youtube.com", "apple.com", "google.com",
+)
+PLATFORM_PATTERN = re.compile(r"(?:^|\.)(?:cmail\d+\.com|sendib[tm]\d+\.com)$")
+FREEMAIL = ("gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "hotmail.fr", "live.com", "live.fr", "yahoo.com",
+            "yahoo.fr", "icloud.com", "me.com", "orange.fr", "wanadoo.fr", "free.fr", "sfr.fr", "laposte.net", "proton.me",
+            "protonmail.com", "gmx.com", "gmx.fr", "aol.com", "msn.com")
+# Local parts of an address a company sends from (not a person): the From claims to be an organisation.
+ROLE_PREFIXES = ("noreply", "donotreply", "notification", "newsletter", "service", "support", "contact", "info", "news",
+                 "alert", "mailer", "billing", "account", "security", "order", "commande", "delivery", "shipping",
+                 "customer", "client", "colis", "livraison", "facture", "invoice", "hello", "team", "admin")
+# Words too common in company names to prove an imitation.
+GENERIC_WORDS = ("france", "online", "service", "services", "mail", "email", "group", "groupe", "shop", "store", "paris",
+                 "europe", "direct", "media", "news", "web", "club", "info", "bank", "banque", "assurance", "poste",
+                 "colis", "livraison", "client", "secure", "login", "account", "compte", "tracking", "suivi")
+SECOND_LEVEL = {"co", "com", "org", "net", "gov", "ac", "edu"}
+
+PLACEHOLDER_WORDS = ("prenom", "prénom", "nom", "name", "firstname", "first_name", "lastname", "last_name", "fullname",
+                     "full_name", "civilite", "civilité", "client", "customer", "email", "montant", "amount", "date",
+                     "order", "commande", "link", "lien", "url", "company", "societe", "société")
+PLACEHOLDERS = re.compile(
+    r"\{\{\s*[\w .|-]{1,30}\s*\}\}"                                    # {{name}} (any identifier)
+    r"|\{\s*(?:" + "|".join(PLACEHOLDER_WORDS) + r")\s*\}"             # {prenom}, {nom}
+    r"|%[A-Z][A-Z_]{3,24}%"                                            # %FIRSTNAME%
+    r"|\[\[\s*[\w .-]{1,30}\s*\]\]|\*\|[A-Z_]{2,20}\|\*|<<\s*[\w .-]{1,30}\s*>>|\$\{\s*\w{1,30}\s*\}", re.I)
+PLACEHOLDERS_CASE = re.compile(r"%[A-Z][A-Z_]{3,24}%|\*\|[A-Z_]{2,20}\|\*")  # these two only match upper case
+
+URGENCY = ("urgent", "immédiatement", "immediatement", "dernier rappel", "dernier avis", "dernière chance", "sous 24",
+           "sous 48", "action requise", "action immédiate", "sera suspendu", "sera bloqué", "sera fermé", "sera désactivé",
+           "dernier délai", "avant le blocage", "immediately", "final notice", "last reminder", "last chance",
+           "within 24 hours", "within 48 hours", "action required", "will be suspended", "will be closed", "will be locked",
+           "account suspended", "act now", "verify your account", "confirm your identity", "vérifiez votre compte",
+           "vérifier votre compte", "confirmez votre identité")
+PAYMENT = ("paiement", "payer", "régler", "règlement", "frais de livraison", "frais de port", "frais de douane",
+           "facture impayée", "impayé", "remboursement", "carte bancaire", "coordonnées bancaires", "numéro de carte",
+           "iban", "virement", "carte cadeau", "mettre à jour votre moyen", "payment", "pay now", "invoice", "overdue",
+           "refund", "credit card", "bank details", "wire transfer", "gift card", "billing information", "customs fee",
+           "delivery fee", "update your payment")
+
+
+def on_platform(host: str) -> bool:
+    return any(host == d or host.endswith("." + d) for d in PLATFORMS) or bool(PLATFORM_PATTERN.search(host))
+
+
+def org_domain(host: str) -> str:
+    """Registrable domain, without a suffix list: last two labels, three for co.uk / com.au style suffixes."""
+    labels = host.lower().rstrip(".").split(".")
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in SECOND_LEVEL:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _label(host: str) -> str:
+    """The name part of a domain: everything left of the suffix (ml-colis-relay.com -> ml-colis-relay)."""
+    suffix = org_domain(host).partition(".")[2]
+    return host[:-len(suffix) - 1] if suffix and host.endswith("." + suffix) else host
+
+
+def freemail(domain: str) -> bool:
+    return any(domain == d or domain.endswith("." + d) for d in FREEMAIL)
+
+
+def _core(text: str) -> str:
+    """A domain name reduced to letters and digits, with generic words turned into breaks."""
+    text = text.lower()
+    for word in sorted(GENERIC_WORDS, key=len, reverse=True):
+        text = text.replace(word, "|")
+    return re.sub(r"[^a-z0-9|]", "", text)
+
+
+def _common(a: str, b: str) -> int:
+    """Length of the longest common substring, with no break (|) inside."""
+    best, row = 0, [0] * (len(b) + 1)
+    for ca in a:
+        new = [0] * (len(b) + 1)
+        for j, cb in enumerate(b, 1):
+            if ca == cb and ca != "|":
+                new[j] = row[j - 1] + 1
+                best = max(best, new[j])
+        row = new
+    return best
+
+
+def imitates(brand: str, host: str) -> bool:
+    """Does `host` borrow the brand name (at least 5 letters of it in a row, or the whole of a short brand)?"""
+    brand_core, host_core = _core(brand), _core(_label(host))
+    if len(brand_core.replace("|", "")) < 3:
+        return False
+    if len(brand_core) < 5:
+        return brand_core in re.split(r"[^a-z0-9]+", _label(host).lower())
+    return _common(brand_core, host_core) >= 5
+
+
+def _first(headers: dict, name: str) -> str:
+    value = headers.get(name)
+    return (value[0] if isinstance(value, list) and value else value) or ""
+
+
+def _address(value: str) -> tuple[str, str, str]:
+    """(display name, local part, domain) of the first address in a header value; '' for what is missing."""
+    for name, addr in getaddresses([value]):
+        if "@" in addr:
+            local, _, domain = addr.rpartition("@")
+            return name, local.lower(), domain.strip(">").lower()
+    return "", "", ""
+
+
+def _claims_brand(name: str, local: str, domain: str) -> bool:
+    if not domain or freemail(domain):
+        return False
+    plain = re.sub(r"[^a-z]", "", local)
+    if plain.startswith(ROLE_PREFIXES):
+        return True
+    label = re.sub(r"[^a-z0-9]", "", org_domain(domain).split(".")[0])
+    return len(label) >= 4 and label in re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def _authentication(headers: dict) -> dict[str, list[str]]:
+    """{method: [results]} from the topmost Authentication-Results (the one your own server wrote; others are written
+    by the sender), else the topmost ARC one; plus the verdict word of Received-SPF."""
+    line = _first(headers, "Authentication-Results") or _first(headers, "ARC-Authentication-Results")
+    found: dict[str, list[str]] = {}
+    for method, result in re.findall(r"\b(spf|dkim|dmarc)\s*=\s*([a-z]+)", line, re.I):
+        found.setdefault(method.lower(), []).append(result.lower())
+    spf = re.match(r"\s*(pass|fail|softfail|neutral|none|permerror|temperror)\b", _first(headers, "Received-SPF"), re.I)
+    if spf and "spf" not in found:
+        found["spf"] = [spf.group(1).lower()]
+    return found
+
+
+def _auth_fail(headers: dict):
+    found = _authentication(headers)
+    parts, weight = [], 0
+    if "fail" in found.get("dmarc", []):
+        parts, weight = parts + ["dmarc=fail"], weight + 35
+    if "fail" in found.get("spf", []):
+        parts, weight = parts + ["spf=fail"], weight + 25
+    elif "softfail" in found.get("spf", []):
+        parts, weight = parts + ["spf=softfail"], weight + 10
+    if "fail" in found.get("dkim", []) and "pass" not in found["dkim"]:
+        parts, weight = parts + ["dkim=fail"], weight + 20
+    if parts:
+        return {"code": "auth_fail", "detail": "Sender authentication failed: " + ", ".join(parts), "weight": min(weight, 45)}
+
+
+def _spam_flag(headers: dict):
+    flag, status = _first(headers, "X-Spam-Flag"), _first(headers, "X-Spam-Status")
+    score = required = None
+    if m := re.search(r"score\s*=\s*(-?\d+(?:\.\d+)?)", status):
+        score = float(m.group(1))
+    elif m := re.match(r"\s*(-?\d+(?:\.\d+)?)", _first(headers, "X-Spam-Score")):
+        score = float(m.group(1))
+    if m := re.search(r"required\s*=\s*(\d+(?:\.\d+)?)", status):
+        required = float(m.group(1))
+    if score is None and (m := re.search(r"\((-?\d+(?:\.\d+)?) points", _first(headers, "X-Spam-Report"))):
+        score = float(m.group(1))
+    if score is None and (bar := _first(headers, "X-Spam-Bar")):
+        score = float(bar.count("+") - bar.count("-")) if set(bar) <= {"+", "-"} else None
+    verdict = flag.strip().lower().startswith("yes") or status.strip().lower().startswith("yes")
+    shown = f" (score {score:g})" if score is not None else ""
+    if verdict or (score is not None and required is not None and score >= required):
+        return {"code": "spam_flag", "detail": f"The mail host's antispam marked it as spam{shown}", "weight": 30}
+    if score is not None and score >= 5:
+        return {"code": "spam_flag", "detail": f"High antispam score {score:g}", "weight": 25}
+    if score is not None and score >= 2:
+        return {"code": "spam_flag", "detail": f"Raised antispam score {score:g}", "weight": 10}
+
+
+def _private(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return (addr.is_loopback or addr.is_link_local or addr.is_unspecified or addr in ipaddress.ip_network("10.0.0.0/8")
+            or addr in ipaddress.ip_network("172.16.0.0/12") or addr in ipaddress.ip_network("192.168.0.0/16")
+            or addr in ipaddress.ip_network("100.64.0.0/10") or addr.version == 6 and addr.is_private)
+
+
+def _first_hop(received: list[str]) -> str | None:
+    """Why the oldest Received line (the first server the message went through) looks improvised, or None."""
+    if not received:
+        return None
+    hop = received[-1]
+    m = re.match(r"\s*from\s+(\S+)", hop, re.I)
+    if not m:
+        return None  # no "from": webmail or internal hand-over, nothing to judge
+    explicit = re.search(r"helo=([^\s)]+)", hop, re.I)
+    helo = (explicit.group(1) if explicit else m.group(1)).strip("[]();,").lower()
+    client = re.split(r"\sby\s", hop, maxsplit=1, flags=re.I)[0]
+    ips = re.findall(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])", client) + re.findall(r"\[([0-9a-f:]*:[0-9a-f:]+)\]", client, re.I)
+    if ips and all(_private(ip) for ip in ips):
+        return None  # the client was on the server itself or a private network: an internal hand-over
+    if helo in ("localhost", "localhost.localdomain", "unknown", "") or re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", helo) \
+            or ":" in helo:
+        shown = f" from {ips[0]}" if ips else ""
+        return f"first hop helo is {helo or 'absent'!r}{shown}"
+    return None
+
+
+def _origin(headers: dict, from_domain: str, brand: bool):
+    if not brand:
+        return None
+    auth = _authentication(headers)
+    if "pass" in auth.get("dkim", []) and "pass" in auth.get("dmarc", ["pass"]) and _signed_by(headers, from_domain):
+        return None
+    problems, weight = [], 0
+    if hop := _first_hop(headers.get("Received") or []):
+        problems.append(hop)
+        weight += 25
+    for name in ("Return-Path", "Reply-To"):
+        _, _, domain = _address(_first(headers, name))
+        if domain and not same_site(org_domain(domain), org_domain(from_domain)) and not on_platform(domain):
+            problems.append(f"{name} domain {domain} differs from From domain {from_domain}")
+            weight += 15
+            break
+    if problems:
+        return {"code": "origin_mismatch", "detail": "; ".join(problems), "weight": min(weight, 40)}
+
+
+def _signed_by(headers: dict, from_domain: str) -> bool:
+    """A DKIM signature whose domain is the From domain's: only worth something next to a dkim=pass."""
+    return any(sig.get("d") and same_site(org_domain(sig["d"].lower()), org_domain(from_domain))
+               for sig in headers.get("DKIM-Signature") or [] if isinstance(sig, dict))
+
+
+def _link_domains(links: list[dict]) -> list[str]:
+    return list(dict.fromkeys(link["domain"] for link in links if link.get("domain")))
+
+
+def _link_signals(links: list[dict], from_domain: str, brand_label: str, brand: bool):
+    out = []
+    hosts = _link_domains(links)
+    if from_domain and hosts and not any(same_site(h, org_domain(from_domain)) for h in hosts) \
+            and not freemail(from_domain):
+        others = [h for h in hosts if not on_platform(h)]
+        out.append({"code": "link_domain_mismatch", "weight": 15 if others else 5,
+                    "detail": f"No link on {org_domain(from_domain)}; links go to " + ", ".join(hosts[:3])
+                              + (" (known mailing platforms)" if not others else "")})
+    lookalikes = []
+    if brand_label and from_domain:
+        lookalikes = [h for h in hosts if not on_platform(h) and not same_site(h, org_domain(from_domain))
+                      and imitates(brand_label, h)]
+    idn = [link["domain"] for link in links if link.get("idn") and link.get("domain")]
+    if lookalikes or idn:
+        out.append({"code": "lookalike_domain", "weight": 35 if lookalikes else 30,
+                    "detail": (f"Domain {lookalikes[0]} imitates the sender's name {brand_label!r}" if lookalikes
+                               else f"Domain {idn[0]} uses look-alike (IDN/punycode) characters")})
+    shown = [link for link in links if link.get("mismatch")]
+    if shown:
+        link = shown[0]
+        platform = on_platform(link.get("domain", ""))
+        out.append({"code": "display_mismatch", "weight": 10 if platform else 35,
+                    "detail": f"Link text shows {link.get('shown')} but goes to {link.get('domain')}"
+                              + (" (known mailing platform)" if platform else "")})
+    return out
+
+
+def _text_signals(text: str) -> list[dict]:
+    text = text[:BODY_SCAN_MAX]
+    out = []
+    found = [m.group(0) for m in PLACEHOLDERS.finditer(text)
+             if m.group(0).startswith(("{", "[", "<", "$")) or PLACEHOLDERS_CASE.fullmatch(m.group(0))]
+    if found:
+        out.append({"code": "template_placeholder", "weight": 20,
+                    "detail": "Unfilled template field in the text: " + ", ".join(dict.fromkeys(found[:3]))})
+    lower = text.lower()
+    hits = [(group, [w for w in words if w in lower]) for group, words in (("urgency", URGENCY), ("payment", PAYMENT))]
+    hits = [(group, words) for group, words in hits if words]
+    if hits:
+        out.append({"code": "urgency_payment", "weight": 6 * len(hits),
+                    "detail": "; ".join(f"{group}: {', '.join(repr(w) for w in words[:2])}" for group, words in hits)})
+    return out
+
+
+def phishing_score(headers: dict, links: list[dict], body_text: str) -> dict:
+    """Suspicion of phishing, from what the other functions of this module extract; no network access.
+
+    `headers` is the dict of `raw_headers`/`auth_headers`, `links` the list of `extract_links`, `body_text` the
+    text of the mail. Returns {score: 0-100, level: low|medium|high, reasons: [{code, detail, weight}]}, the
+    reasons by decreasing weight. A score is a hint to look closer, never a verdict."""
+    name, local, from_domain = _address(_first(headers, "From"))
+    brand = _claims_brand(name, local, from_domain)
+    brand_label = re.sub(r"[^a-z0-9-]", "", org_domain(from_domain).split(".")[0]) if brand else ""
+    reasons = [r for r in (_auth_fail(headers), _spam_flag(headers), _origin(headers, from_domain, brand)) if r]
+    reasons += _link_signals(links, from_domain, brand_label, brand)
+    reasons += _text_signals(body_text or "")
+    reasons = sorted(({"code": r["code"], "detail": r["detail"], "weight": r["weight"]} for r in reasons),
+                     key=lambda r: -r["weight"])
+    score = min(sum(r["weight"] for r in reasons), 100)
+    level = "high" if score >= LEVEL_HIGH else "medium" if score >= LEVEL_MEDIUM else "low"
+    return {"score": score, "level": level, "reasons": reasons}

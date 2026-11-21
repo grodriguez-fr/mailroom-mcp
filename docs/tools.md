@@ -184,13 +184,33 @@ at the end). It counts characters of the cleaned text, not of the raw message, a
 it can be below `max_chars` while more text follows.
 
 `security` (default false, so ordinary reads stay light) adds a `security` object to check a mail for phishing in
-the same call, from the headers already fetched and, for links, the HTML part (downloaded only then, when the text
+the same call (a suspicion score, the evidence headers and the link targets), from the headers already fetched and, for links, the HTML part (downloaded only then, when the text
 part was chosen for the body). Nothing is fetched from the network: a link is never opened, resolved or followed.
 It comes with every page of a long text, so ask for it once.
 
+- `security.phishing`: `{score, level, reasons}`, a hint to look closer, never a verdict, computed without network
+  access from the whole evidence (before any size cut). `score` is 0-100 (the sum of the weights, capped), `level` is
+  `low` (< 30), `medium` (30-59) or `high` (>= 60), `reasons` is `[{code, detail, weight}]` by decreasing weight, the
+  `detail` a short English sentence with the value at fault. It only reports: nothing is moved, flagged or marked.
+
+  | code | weight | signal |
+  |---|---|---|
+  | `auth_fail` | dmarc fail 35, spf fail 25, dkim fail 20, spf softfail 10 (sum, max 45) | topmost `Authentication-Results` (else the topmost ARC one, else `Received-SPF` for SPF); a later `Authentication-Results` is written by the sender and ignored |
+  | `spam_flag` | 30 flag/status "Yes" or score >= required; 25 score >= 5; 10 score >= 2 | the mail host's `X-Spam-Flag`, `X-Spam-Status`, `X-Spam-Score`, `X-Spam-Bar` |
+  | `origin_mismatch` | 25 + 15 (max 40) | the From is a company address (`noreply@`, `service@`..., or the display name carries the domain's name) and the oldest `Received` hop comes from a public IP with HELO `localhost`, a bare IP or none; or `Return-Path` / `Reply-To` is on another domain than the From (mailing platforms excepted). Skipped when a DKIM signature of the From domain passed |
+  | `link_domain_mismatch` | 15; 5 if the other links are all known mailing platforms or large sites | no `http(s)` link is on the From domain (subdomains count); not for free mail providers |
+  | `lookalike_domain` | 35 brand word; 30 IDN only | a link's domain shares 5 letters in a row with the From domain's name without being it (`mondialrelay.fr` -> `ml-colis-relay.com`), generic words (`france`, `service`...) excepted; or an IDN / `xn--` host |
+  | `display_mismatch` | 35; 10 if the destination is a known mailing platform | a link whose text shows another URL (`mismatch`) |
+  | `template_placeholder` | 20 | unfilled `{prenom}`, `{{name}}`, `%FIRSTNAME%`, `*\|FNAME\|*`, `[[nom]]` in the text |
+  | `urgency_payment` | 6 per group, max 12 | urgency words (`urgent`, `sous 24 h`, `action required`...) and payment words (`paiement`, `IBAN`, `gift card`...), French and English |
+
+  A newsletter through a mailing platform (Brevo, Mailchimp, Sendgrid...) triggers only the weak, attenuated
+  signals and stays `low`. The list of platforms and the weights live at the top of the score section of
+  `phishing.py`.
 - `security.headers`: `From`, `Reply-To`, `Return-Path`, `Sender`, `Received` (always a list: every line, in message
   order, the receiving server's first), `Authentication-Results`, `ARC-Authentication-Results`, `Received-SPF`,
-  `Message-ID`, `List-Unsubscribe`; absent ones are left out, a repeated one is a list. `DKIM-Signature` is a list of
+  `X-Spam-Flag`, `X-Spam-Status`, `X-Spam-Score`, `X-Spam-Bar`, `X-Spam-Report` (cut at 300 characters),
+  `Message-ID` (raw text), `List-Unsubscribe`; absent ones are left out, a repeated one is a list. `DKIM-Signature` is a list of
   `{d, s}` (signing domain and selector): the signature itself is never returned. Authentication-Results lines
   other than the one your own server added are written by the sender: only the topmost is evidence.
 - `security.links`: the `<a href>` of the HTML body, deduplicated on URL and displayed text (`count` when repeated):
