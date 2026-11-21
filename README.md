@@ -41,6 +41,7 @@ To reach it from ChatGPT or your phone, run it remotely: [docs/deployment.md](do
 | `MAIL_IMAP_PORT` | `993` |
 | `MAIL_PASSWORD_FILE` | `~/.config/mailroom-mcp/password` |
 | `MAIL_ALIASES` | unset: your other addresses, comma-separated |
+| `MAIL_AUTH_SERVERS` | unset: authserv-ids of your receiving server to trust in `read_message(security=true)`, comma-separated (`mx.google.com` is implied for Gmail) |
 | `MAIL_TIMEZONE` | `UTC` |
 | `MAIL_SEND_ENABLED` | `false`: `true` lets `send_draft` send drafts, after your approval |
 | `MAIL_SMTP_HOST`, `MAIL_SMTP_PORT`, `MAIL_SMTP_SECURITY` | the IMAP host (`smtp.gmail.com` for Gmail), `465`, `ssl` (`starttls` on 587) |
@@ -65,7 +66,9 @@ Relative paths are relative to that file; secrets stay in their own files (mode 
 
 `port` defaults to 993 and, for `google-oauth`, `host` to `imap.gmail.com`. Names are short slugs
 (`[a-z0-9-]`). `aliases` (optional) lists your other addresses for that mailbox, the ones that forward to it or
-that you send from: mail to them is addressed to you, mail from them is your own. `"send": true` (optional, off by
+that you send from: mail to them is addressed to you, mail from them is your own. `auth_servers` (optional) lists the
+authserv-ids of your receiving server whose `Authentication-Results` the phishing check of `read_message` trusts, besides the
+host of the topmost `Received` line (`mx.google.com` is implied for Gmail). `"send": true` (optional, off by
 default) lets the account send drafts; `"smtp": {"host", "port", "security"}` (optional, `"ssl"` or `"starttls"`)
 overrides the server, which defaults to `smtp.gmail.com:465` for Gmail and to the IMAP host on port 465 otherwise.
 For a Gmail account, create the OAuth client and the refresh token once:

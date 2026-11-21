@@ -40,7 +40,7 @@ def test_valid_file_with_defaults_and_relative_paths(accounts_file, tmp_path):
     ({}, "expected a non-empty JSON list of accounts"),
     ([], "expected a non-empty JSON list of accounts"),
     (["perso"], "account 1: expected an object"),
-    ([{**PERSO, "pasword": "x"}], "account 1 ('perso'): unknown key 'pasword' (allowed: aliases, auth, host, name, port, send, smtp, user)"),
+    ([{**PERSO, "pasword": "x"}], "account 1 ('perso'): unknown key 'pasword' (allowed: aliases, auth, auth_servers, host, name, port, send, smtp, user)"),
     ([{k: v for k, v in PERSO.items() if k != "user"}], "account 1 ('perso'): missing 'user'"),
     ([{**PERSO, "name": "Perso Mail"}], "name must be a short slug (lowercase letters, digits and dashes"),
     ([{**PERSO, "name": "*"}], "name must be a short slug"),
@@ -112,6 +112,39 @@ def test_mail_aliases_conflicts_with_the_accounts_file(accounts_file, monkeypatc
     accounts_file([PERSO])
     monkeypatch.setenv("MAIL_ALIASES", "me@work.example")
     with pytest.raises(config.ConfigError, match="^MAIL_ACCOUNTS_FILE is set: remove MAIL_ALIASES"):
+        config.accounts()
+
+
+def test_auth_servers_per_account_and_the_gmail_default(accounts_file):
+    accounts_file([{**PERSO, "auth_servers": [" MX.Example.org.", "mx.example.org", "in.example.net"]}, WORK])
+    perso, work = config.accounts()
+    assert perso.auth_servers == ("mx.example.org", "in.example.net") and perso.trusted_auth_servers == perso.auth_servers
+    assert work.auth_servers == () and work.trusted_auth_servers == ("mx.google.com",)   # Gmail: deduced from the account
+    accounts_file([{**PERSO, "host": "imap.gmail.com", "auth_servers": ["mx.google.com", "gate.example.org"]}])
+    (gmail_password,) = config.accounts()
+    assert gmail_password.trusted_auth_servers == ("mx.google.com", "gate.example.org")   # imap.gmail.com with a password too
+
+
+@pytest.mark.parametrize("value", ["mx.example.org", ["mx"], ["mx.example.org/x"], ["mx example.org"], [42], ["-a.example.org"]])
+def test_invalid_auth_servers_are_clear_errors(accounts_file, value):
+    accounts_file([{**PERSO, "auth_servers": value}])
+    with pytest.raises(config.ConfigError, match="account 1 \\('perso'\\): auth_servers: expected "):
+        config.accounts()
+
+
+def test_mail_auth_servers_for_the_single_account(monkeypatch):
+    assert config.accounts()[0].trusted_auth_servers == ()
+    monkeypatch.setenv("MAIL_AUTH_SERVERS", "mx.example.org, MX2.example.org,,mx.example.org")
+    assert config.accounts()[0].auth_servers == ("mx.example.org", "mx2.example.org")
+    monkeypatch.setenv("MAIL_AUTH_SERVERS", "nowhere")
+    with pytest.raises(config.ConfigError, match="^MAIL_AUTH_SERVERS: expected host names such as mx.example.org, got 'nowhere'"):
+        config.accounts()
+
+
+def test_mail_auth_servers_conflicts_with_the_accounts_file(accounts_file, monkeypatch):
+    accounts_file([PERSO])
+    monkeypatch.setenv("MAIL_AUTH_SERVERS", "mx.example.org")
+    with pytest.raises(config.ConfigError, match="^MAIL_ACCOUNTS_FILE is set: remove MAIL_AUTH_SERVERS"):
         config.accounts()
 
 

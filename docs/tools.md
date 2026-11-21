@@ -19,6 +19,10 @@ single account it can be left out (a different name is an error). With several:
   deduplicated ignoring case. Mail to an alias is addressed to that account (`to_me`, the To check of
   `answered=false`, `to` left out of rows); mail from any account's user or alias is your own mail
   (`excluded_from_me`). `mailroom-mcp --check` prints the number of aliases of each account.
+- `auth_servers` (optional, per account; `MAIL_AUTH_SERVERS`, comma-separated, for the single account) lists the
+  authserv-ids of the receiving server whose `Authentication-Results` the phishing check trusts, besides the host of the
+  topmost `Received` line (see `security.auth`). Host names, lower case, deduplicated. A Gmail account (`google-oauth`, or
+  host `imap.gmail.com`) always trusts `mx.google.com`.
 - A search over several accounts keeps the single-account contract: one date-sorted list, exact pagination,
   size capping, `group_by` over the whole filter (groups are per account: the same sender in two accounts gives
   two groups), `latest_before`. `folders_excluded` becomes `{account: [folders]}`. An unreachable account, or
@@ -188,6 +192,16 @@ the same call (a suspicion score, the evidence headers and the link targets), fr
 part was chosen for the body). Nothing is fetched from the network: a link is never opened, resolved or followed.
 It comes with every page of a long text, so ask for it once.
 
+- `security.auth`: `receiver` when the receiving server wrote an `Authentication-Results` or a `Received-SPF` that the
+  score used, `unknown` otherwise (no such line, or only lines the sender could have written: then the mail is neither
+  authenticated nor failed, and no result of its headers is trusted, whatever `security.headers` shows). The receiving
+  server is the host named by `by` in the topmost `Received` line (nobody can write above it) or an `auth_servers`
+  entry. A result counts when its authserv-id is that server or on its organisational domain, and it sits above the
+  first `Received` line that another server wrote. `ARC-Authentication-Results` is never used: its seal cannot be
+  checked without cryptography and DNS lookups, which the server does not do. The signatures are not checked either, so a
+  host that writes no `Authentication-Results` gives `unknown` (a sender that guesses the receiving host's name and
+  talks to it directly can still write a line that looks like its own: the check narrows what a sender can claim, it does
+  not replace a verified DKIM).
 - `security.phishing`: `{score, level, reasons}`, a hint to look closer, never a verdict, computed without network
   access from the whole evidence (before any size cut). `score` is 0-100 (the sum of the weights, capped), `level` is
   `low` (< 30), `medium` (30-59) or `high` (>= 60), `reasons` is `[{code, detail, weight}]` by decreasing weight, the
@@ -195,7 +209,7 @@ It comes with every page of a long text, so ask for it once.
 
   | code | weight | signal |
   |---|---|---|
-  | `auth_fail` | dmarc fail 35, spf fail 25, dkim fail 20, spf softfail 10 (sum, max 45) | topmost `Authentication-Results` (else the topmost ARC one, else `Received-SPF` for SPF); a later `Authentication-Results` is written by the sender and ignored |
+  | `auth_fail` | dmarc fail 35, spf fail 25, dkim fail 20, spf softfail 10 (sum, max 45) | the receiving server's `Authentication-Results` (`security.auth`), `Received-SPF` for SPF when it has none; any other one is written by the sender and ignored |
   | `spam_flag` | 30 flag/status "Yes" or score >= required; 25 score >= 5; 10 score >= 2 | the mail host's `X-Spam-Flag`, `X-Spam-Status`, `X-Spam-Score`, `X-Spam-Bar` |
   | `origin_mismatch` | first external hop: 35 `localhost` helo; 15 bare IP or no helo (5 with an aligned DKIM); 25 local hand-over on a third party's server; + 25 / 15 / 5 for Reply-To / Return-Path (max 60) | the *first external hop* is the oldest `Received` line whose client has a public IP, whatever the From looks like (SMTP AUTH submissions excepted). A hop on a private or loopback address (10/8, 172.16/12, 192.168/16, 127/8, fc00::/7, ::1) or with a container hostname as helo (12 hex characters) is internal and never judged. Helo `localhost` from a public IP is 35 even with a signature; a bare IP (or no helo) is 15, or 5 when a DKIM signature of the From domain passed. The *local hand-over* (25) is a `localhost` / `127.0.0.1` hop on a server that is not the receiving one (a third party's own machine writing under the From's name) when the From claims a company or a brand and no aligned DKIM vouches for it; a signed company's internal relay is not one. Also, when the From is a company address (`noreply@`, `service@`..., or the display name carries the domain's name), `Return-Path` / `Reply-To` on another domain than the From (mailing platforms excepted): 25 on a free webmail, else 15, or 5 with an aligned DKIM |
   | `link_domain_mismatch` | 15; 5 if the other links are all known sending / tracking domains or large sites | no `http(s)` link is on the From domain (subdomains count); not for free mail providers. Link shorteners and redirectors (`share.google`, `bit.ly`, `t.co`, `tinyurl.com`, `lnkd.in`...) are off-domain links, never known platforms |
@@ -206,8 +220,10 @@ It comes with every page of a long text, so ask for it once.
   | `template_placeholder` | 20 | unfilled `{prenom}`, `{{name}}`, `%FIRSTNAME%`, `*\|FNAME\|*`, `[[nom]]` in the text |
   | `urgency_payment` | 6 per group, max 12 | urgency words (`urgent`, `sous 24 h`, `action required`...) and payment words (`paiement`, `IBAN`, `gift card`...), French and English |
 
-  An *aligned DKIM* is a `dkim=pass` (and no dmarc failure: `dmarc=none` is not one) in the topmost
-  `Authentication-Results` whose `d=` is the From's own domain. When it is aligned and the first hop is not `localhost`
+  An *aligned DKIM* is a `dkim=pass` (and no dmarc failure: `dmarc=none` is not one) in the receiving server's
+  `Authentication-Results` whose `header.d` (else the domain of `header.i`) is the From's own domain. The `d=` of the
+  `DKIM-Signature` headers never counts by itself (anyone can add a signature that claims the bank's domain); a passing
+  result that names no domain aligns the mail only when it carries exactly one signature, and that signature's `d=`. When it is aligned and the first hop is not `localhost`
   from a public IP, `link_domain_mismatch`, `display_mismatch` and `lookalike_domain` are capped at 5 each (an IDN link
   keeps its weight): a newsletter or a notification through a mailing platform (Brevo, Mailchimp, Intercom,
   SparkPost...) triggers only those and stays `low`. The list of platforms and the weights live at the top of the score

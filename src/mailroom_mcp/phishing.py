@@ -21,6 +21,7 @@ HEADERS = ("From", "Reply-To", "Return-Path", "Sender", "Received", "Authenticat
            "ARC-Authentication-Results", "Received-SPF", "X-Spam-Flag", "X-Spam-Status", "X-Spam-Score", "X-Spam-Bar",
            "X-Spam-Report", "Message-ID", "List-Unsubscribe")
 EVIDENCE_HEADERS = ("List-Id", "X-Google-Group-Id")   # read by the score only, never returned
+ORDER_HEADERS = ("received", "authentication-results", "received-spf")   # whose relative position decides who wrote them
 LONG_HEADERS = {"X-Spam-Report": 300}   # verbose by nature: shortened harder than VALUE_MAX
 RAW_HEADERS = {"Message-ID"}            # the parsed form stops at the first malformed character: keep the raw text
 
@@ -65,6 +66,9 @@ def raw_headers(msg) -> dict:
             values = header_values(msg, name)
         if values:
             out[name] = values[0] if len(values) == 1 and name != "Received" else values  # Received: always a list
+    order = [k.lower() for k, _ in msg.raw_items() if k.lower() in ORDER_HEADERS]
+    if order:
+        out["_Order"] = order   # message order of those headers, top first: the k-th "received" is Received[k]; never returned
     return out
 
 
@@ -245,8 +249,9 @@ def extract_links(markup: str) -> list[dict]:
 # From domain signed the message.
 #
 #   code                   weight                                   what it means
-#   auth_fail              dmarc 35, spf 25, dkim 20, softfail 10   topmost Authentication-Results / Received-SPF
-#                          (sum, max 45)                            say the sender is not who it claims
+#   auth_fail              dmarc 35, spf 25, dkim 20, softfail 10   the receiving server's Authentication-Results /
+#                          (sum, max 45)                            Received-SPF (trusted_results) say the sender is not
+#                                                                   who it claims; any other one is ignored
 #   spam_flag              30 (flag / status "Yes", score>=required) the host's own antispam verdict
 #                          25 (score >= 5), 10 (score >= 2)
 #   origin_mismatch        first external hop = the oldest Received   whatever the From looks like (not for SMTP-AUTH
@@ -291,8 +296,9 @@ def extract_links(markup: str) -> list[dict]:
 #   template_placeholder   20                                        {prenom}, {{name}}, %FIRSTNAME% unfilled
 #   urgency_payment        6 per group (urgency, payment), max 12    pressure and money words, FR/EN
 #
-# "Aligned DKIM": a dkim=pass in the topmost Authentication-Results (and no dmarc fail: dmarc=none does not count as one)
-# whose d= is the From's organisational domain. When it is aligned AND the first hop is not "localhost" from a public IP, link_domain_mismatch,
+# "Aligned DKIM": a dkim=pass in the receiving server's Authentication-Results (trusted_results; and no dmarc fail:
+# dmarc=none does not count as one) whose header.d (else header.i) is the From's organisational domain; the d= of the
+# DKIM-Signature headers is never read on its own. When it is aligned AND the first hop is not "localhost" from a public IP, link_domain_mismatch,
 # display_mismatch and lookalike_domain are capped at 5 each, except a link to an IDN / punycode host, which keeps its
 # weight. A "localhost" first hop from a public address is never excused by a signature: none of the attenuations above
 # (same brand, bounce service, relay, no-link titles) applies then, nor without an aligned DKIM.
@@ -498,21 +504,112 @@ def _claims_brand(name: str, local: str, domain: str) -> bool:
     return len(label) >= 4 and label in re.sub(r"[^a-z0-9]", "", name.lower())
 
 
-def _authentication(headers: dict) -> dict[str, list[str]]:
-    """{method: [results]} from the topmost Authentication-Results (the one your own server wrote; others are written
-    by the sender), else the topmost ARC one; plus the verdict word of Received-SPF."""
-    line = _first(headers, "Authentication-Results") or _first(headers, "ARC-Authentication-Results")
+def _all(headers: dict, name: str) -> list[str]:
+    value = headers.get(name)
+    return [value] if isinstance(value, str) else [v for v in value or [] if isinstance(v, str)]
+
+
+def _is_host(name: str) -> bool:
+    """A DNS host name (at least two labels, alphabetic top label): not an IP, an IPv6 token or a bare word."""
+    return bool(re.fullmatch(r"(?:[a-z0-9_-]+\.)+[a-z][a-z0-9-]*", name))
+
+
+def _same_server(a: str, b: str) -> bool:
+    return _is_host(a) and _is_host(b) and (a == b or org_domain(a) == org_domain(b))
+
+
+def _authserv_id(value: str) -> str:
+    m = re.match(r"\s*([^\s;]+)", value)
+    return m.group(1).lower().rstrip(".") if m else ""
+
+
+def trusted_results(headers: dict, servers: tuple[str, ...] = ()) -> dict[str, str]:
+    """{"ar": Authentication-Results value, "spf": Received-SPF value} written by the receiving server, '' for what has
+    no such line. Everything else is text the sender wrote: any sender can add `Authentication-Results: x; dkim=pass`.
+
+    The receiving server is the host in the `by` of the topmost Received line (nobody can add a line above it) and the
+    configured `servers` (authserv-ids; mx.google.com for Gmail, whose topmost line only names an internal token). An
+    Authentication-Results counts when its authserv-id is that server or on its organisational domain; a Received-SPF
+    when the host named in its comment is, or when it names none. Both must sit above the first Received line
+    that another server wrote: the first one, from the top, whose `by` is a host other than the receiver's (an
+    internal hand-over below the receiver's own line, or a bare token under it, is not the receiver's either). The
+    topmost line that qualifies is used. ARC-Authentication-Results is never used: its seal cannot be checked
+    without cryptography and DNS, which this module does not do. Without such a line the authentication is unknown."""
+    received = _all(headers, "Received")
+    ids = {s.lower().rstrip(".") for s in servers}
+    top = _by(received[0]) if received else ""
+    if _is_host(top):
+        ids.add(top)
+    if not ids:
+        return {"ar": "", "spf": ""}
+    ids = {i for i in ids if _is_host(i)}
+
+    def receiver(host: str) -> bool:
+        return any(_same_server(host, i) for i in ids)
+
+    bys, boundary, seen = [_by(line) for line in received], None, False
+    for index, by in enumerate(bys):
+        if _is_host(by):
+            if not receiver(by):
+                boundary = index
+                break
+            seen = True
+        elif seen:
+            boundary = index
+            break
+
+    order = headers.get("_Order")
+
+    def above(name: str, index: int) -> bool:
+        """Is the `index`-th line of that header above the first Received line another server wrote?"""
+        if boundary is None:
+            return True
+        if not isinstance(order, list):
+            return False   # no positions: cannot tell
+        nth = [i for i, h in enumerate(order) if h == name.lower()]
+        if index >= len(nth):
+            return False
+        return sum(1 for h in order[:nth[index]] if h == "received") <= boundary
+
+    out = {"ar": "", "spf": ""}
+    for index, value in enumerate(_all(headers, "Authentication-Results")):
+        if receiver(_authserv_id(value)) and above("Authentication-Results", index):
+            out["ar"] = value
+            break
+    for index, value in enumerate(_all(headers, "Received-SPF")):
+        named = re.search(r"\(\s*([^\s():]+)\s*:", value)
+        if (not named or receiver(named.group(1).lower())) and above("Received-SPF", index):
+            out["spf"] = value
+            break
+    return out
+
+
+_RESULT = re.compile(r"\b(spf|dkim|dmarc)\s*=\s*([a-z]+)\b([^;]*?)(?=\b(?:spf|dkim|dmarc)\s*=|;|$)", re.I | re.S)
+
+
+def _results(line: str) -> list[tuple[str, str, dict[str, str]]]:
+    """[(method, result, {property: value})] of the results of an Authentication-Results value, comments and the
+    authserv-id removed."""
+    body = re.sub(r"\([^)]*\)", " ", line).partition(";")[2]
+    return [(m.group(1).lower(), m.group(2).lower(),
+             {k.lower(): v.lower() for k, v in re.findall(r"\b((?:header|smtp)\.[a-z]+)\s*=\s*([^\s;]+)", m.group(3), re.I)})
+            for m in _RESULT.finditer(body)]
+
+
+def _authentication(trust: dict[str, str]) -> dict[str, list[str]]:
+    """{method: [results]} from the trusted Authentication-Results, and the verdict word of the trusted Received-SPF
+    for SPF when the former has none. Empty when nothing is trusted: unknown, neither pass nor fail."""
     found: dict[str, list[str]] = {}
-    for method, result in re.findall(r"\b(spf|dkim|dmarc)\s*=\s*([a-z]+)", line, re.I):
-        found.setdefault(method.lower(), []).append(result.lower())
-    spf = re.match(r"\s*(pass|fail|softfail|neutral|none|permerror|temperror)\b", _first(headers, "Received-SPF"), re.I)
+    for method, result, _ in _results(trust["ar"]):
+        found.setdefault(method, []).append(result)
+    spf = re.match(r"\s*(pass|fail|softfail|neutral|none|permerror|temperror)\b", trust["spf"], re.I)
     if spf and "spf" not in found:
         found["spf"] = [spf.group(1).lower()]
     return found
 
 
-def _auth_fail(headers: dict):
-    found = _authentication(headers)
+def _auth_fail(auth: dict[str, list[str]]):
+    found = auth
     parts, weight = [], 0
     if "fail" in found.get("dmarc", []):
         parts, weight = parts + ["dmarc=fail"], weight + 35
@@ -632,10 +729,9 @@ def _by(line: str) -> str:
     return m.group(1).strip("[]();,").lower() if m else ""
 
 
-def _aligned(headers: dict, from_domain: str) -> bool:
-    """A dkim=pass in the topmost Authentication-Results, signed by the From's own domain (header.d of the result or d= of
-    a signature). A dmarc failure cancels it; dmarc=none or an unknown dmarc result does not."""
-    return bool(from_domain) and org_domain(from_domain) in _dkim_pass_domains(headers)
+def _aligned(domains: set[str], from_domain: str) -> bool:
+    """The From's own domain is among the domains that a trusted `dkim=pass` ties to a signature."""
+    return bool(from_domain) and org_domain(from_domain) in domains
 
 
 def _origin(headers: dict, from_domain: str, brand: bool, hop: dict | None, aligned: bool, trusted: bool = True,
@@ -684,16 +780,27 @@ def _same_brand(host: str, from_domain: str) -> bool:
         and not redirector(host)
 
 
-def _dkim_pass_domains(headers: dict) -> set[str]:
-    """Registrable domains that signed the mail while the topmost Authentication-Results says dkim=pass (and no dmarc
-    failure): the d= of the signatures and the header.d of the passing results. Empty when nothing passed."""
-    auth = _authentication(headers)
+def _dkim_pass_domains(headers: dict, trust: dict[str, str]) -> set[str]:
+    """Registrable domains that a trusted Authentication-Results ties to a `dkim=pass` (and no dmarc failure): the
+    header.d of each passing result, else the domain of its header.i. A passing result with neither names no domain:
+    it vouches for the d= of the DKIM-Signature only when the message carries exactly one. The signatures of the
+    message never add a domain by themselves (anyone can add a signature that claims the bank's d=)."""
+    auth = _authentication(trust)
     if "pass" not in auth.get("dkim", []) or "fail" in auth.get("dmarc", []):
         return set()
-    line = _first(headers, "Authentication-Results") or _first(headers, "ARC-Authentication-Results")
-    domains = {org_domain(d.lower()) for d in re.findall(r"dkim\s*=\s*pass[^;]*?header\.d\s*=\s*([a-z0-9.-]+)", line, re.I)}
-    return domains | {org_domain(sig["d"].lower()) for sig in headers.get("DKIM-Signature") or []
-                      if isinstance(sig, dict) and sig.get("d")}
+    domains, bare = set(), False
+    for method, result, props in _results(trust["ar"]):
+        if method != "dkim" or result != "pass":
+            continue
+        domain = (props.get("header.d") or props.get("header.i", "").rpartition("@")[2]).strip(".")
+        if _is_host(domain):
+            domains.add(org_domain(domain))
+        else:
+            bare = True
+    signatures = [sig for sig in headers.get("DKIM-Signature") or [] if isinstance(sig, dict)]
+    if bare and len(signatures) == 1 and signatures[0].get("d"):
+        domains.add(org_domain(signatures[0]["d"].lower()))
+    return domains
 
 
 def _via(name: str) -> str:
@@ -856,31 +963,36 @@ def _text_signals(text: str) -> list[dict]:
     return out
 
 
-def _context(headers: dict) -> dict:
-    """What the signals share: the From split up, its alignment with the DKIM, the first hop and what attenuates."""
+def _context(headers: dict, servers: tuple[str, ...] = ()) -> dict:
+    """What the signals share: the From split up, the trusted authentication, its alignment with the DKIM, the first hop
+    and what attenuates."""
     name, local, from_domain = _address(_first(headers, "From"))
     brand = _claims_brand(name, local, from_domain)
-    aligned = _aligned(headers, from_domain)
+    trust = trusted_results(headers, servers)
+    domains = _dkim_pass_domains(headers, trust)
+    aligned = _aligned(domains, from_domain)
     named = _display_name(name, local, from_domain, aligned)
     hop = _origin_hop(headers.get("Received") or [], aligned, brand or named is not None)
     trusted = not (hop and hop["kind"] == "localhost")   # a "localhost" hand-over from a public IP is never excused
-    passed = _dkim_pass_domains(headers) if trusted else set()
-    return {"name": name, "local": local, "from_domain": from_domain, "brand": brand, "named": named, "hop": hop,
+    passed = domains if trusted else set()
+    return {"auth": _authentication(trust), "name": name, "local": local, "from_domain": from_domain, "brand": brand, "named": named, "hop": hop,
             "brand_label": re.sub(r"[^a-z0-9-]", "", org_domain(from_domain).split(".")[0]) if brand else "",
             "aligned": aligned, "attenuate": aligned and trusted, "trusted": trusted, "passed": passed,
             "relay": _relay_vouched(headers, name, from_domain, passed)}
 
 
-def phishing_score(headers: dict, links: list[dict], body_text: str, subject: str = "") -> dict:
+def phishing_score(headers: dict, links: list[dict], body_text: str, subject: str = "",
+                   trusted_servers: tuple[str, ...] = ()) -> dict:
     """Suspicion of phishing, from what the other functions of this module extract; no network access.
 
     `headers` is the dict of `raw_headers`/`auth_headers`, `links` the list of `extract_links`, `body_text` the
     text of the mail, `subject` its subject (read for wording only). Returns {score: 0-100, level: low|medium|high,
     reasons: [{code, detail, weight}]}, the reasons by decreasing weight. A score is a hint to look closer, never a
-    verdict."""
-    c = _context(headers)
+    verdict. `trusted_servers`: the authserv-ids of the account's receiving server (see `trusted_results`); without a
+    trusted Authentication-Results the authentication is unknown and neither attenuates nor penalises."""
+    c = _context(headers, trusted_servers)
     from_domain, hop, aligned, attenuate = c["from_domain"], c["hop"], c["aligned"], c["attenuate"]
-    reasons = [r for r in (_auth_fail(headers), _spam_flag(headers),
+    reasons = [r for r in (_auth_fail(c["auth"]), _spam_flag(headers),
                            _origin(headers, from_domain, c["brand"], hop, aligned, c["trusted"], c["relay"])) if r]
     reasons += _link_signals(links, from_domain, c["brand_label"], aligned, attenuate)
     reasons += _text_signals(body_text or "")
@@ -910,10 +1022,10 @@ def phishing_score(headers: dict, links: list[dict], body_text: str, subject: st
 
 # --- What to keep when the report is too big ---
 
-def order_links(headers: dict, links: list[dict]) -> tuple[list[dict], int]:
+def order_links(headers: dict, links: list[dict], trusted_servers: tuple[str, ...] = ()) -> tuple[list[dict], int]:
     """(links with the flagged ones first, how many are flagged): a text that shows another domain, then an IDN host or a
     look-alike of the sender's name, then the others, each group in message order."""
-    c = _context(headers)
+    c = _context(headers, trusted_servers)
     lookalikes = set(_lookalike_hosts(links, c["from_domain"], c["brand_label"], c["aligned"], c["attenuate"]))
 
     def rank(link):

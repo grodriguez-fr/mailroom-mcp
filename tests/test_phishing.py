@@ -1,8 +1,10 @@
 """read_message(security=true): authentication headers and real link targets, from a spoofed parcel notice.
 Everything is fake (reserved .example domains); no link is ever followed."""
 
+import email
 import json
 import socket
+from email import policy
 
 import pytest
 from test_contract import stdio_tools
@@ -271,6 +273,13 @@ def test_security_description_stays_within_the_budget_and_schema_is_strict():
 
 
 # --- phishing_score ---
+def scored(headers, links, body_text, subject=""):
+    """phishing_score for hand-built evidence: the account's receiving server is mx.example.org, and its results sit
+    above every Received line (what raw_headers records for a real message)."""
+    order = [name.lower() for name in ("Authentication-Results", "Received-SPF", "Received") for _ in phishing._all(headers, name)]
+    return phishing.phishing_score({"_Order": order, **headers}, links, body_text, subject, ("mx.example.org",))
+
+
 # Fictional hosts only (.example, documentation addresses), except the brand names being imitated.
 
 PARCEL_HEADERS = [
@@ -287,8 +296,8 @@ PARCEL_TEXT = "Bonjour {prenom} {nom}, votre colis est disponible. Gérer ma liv
 NEWSLETTER_HEADERS = [
     ("Return-Path", "<bounce-1234@bnc.sendibt3.com>"),
     ("Received", "from mail-out.sendibm3.com (mail-out.sendibm3.com [198.51.100.20]) by mx.example.org with ESMTPS; Fri, 21 Nov 2026 07:00:00 +0100"),
-    ("Received", "from [10.1.2.3] (unknown [10.1.2.3]) by mail-out.sendibm3.com with SMTP; Fri, 21 Nov 2026 06:59:58 +0100"),
     ("Authentication-Results", "mx.example.org; spf=pass smtp.mailfrom=bnc.sendibt3.com; dkim=pass header.d=marque.fr; dmarc=pass header.from=marque.fr"),
+    ("Received", "from [10.1.2.3] (unknown [10.1.2.3]) by mail-out.sendibm3.com with SMTP; Fri, 21 Nov 2026 06:59:58 +0100"),
     ("DKIM-Signature", "v=1; a=rsa-sha256; d=marque.fr; s=mail; h=from:to:subject; bh=Zm9v; b=QUFB"),
     ("Reply-To", "Marque <contact@marque.fr>"),
     ("List-Unsubscribe", "<https://r.sendibt3.com/u/abc>, <mailto:unsub@marque.fr>"),
@@ -348,8 +357,8 @@ def test_plausible_medium_case(monkeypatch):
 
 
 # Fixtures for the tuning against real false positives: every host is fictional (.example), the brands are made up.
-def aligned_auth(domain):
-    return [("Authentication-Results", f"mx.example.org; spf=pass; dkim=pass header.d={domain}; dmarc=pass header.from={domain}"),
+def aligned_auth(domain, server="mx.example.org"):
+    return [("Authentication-Results", f"{server}; spf=pass; dkim=pass header.d={domain}; dmarc=pass header.from={domain}"),
             ("DKIM-Signature", f"v=1; a=rsa-sha256; d={domain}; s=k1; h=from:to:subject; bh=Zm9v; b=QUFB")]
 
 
@@ -376,7 +385,7 @@ def test_fake_crypto_wallet_notice_scores_high(monkeypatch):
 
 def test_improvised_first_hop_counts_whatever_the_from_looks_like():
     headers = {"From": "Camille <camille@example.org>", "Received": ["from mx by me", LOCALHOST_HOP[1]]}
-    assert codes(phishing.phishing_score(headers, [], "")) == {"origin_mismatch": 35}
+    assert codes(scored(headers, [], "")) == {"origin_mismatch": 35}
 
 
 def test_notification_sent_through_intercom_stays_low(monkeypatch):
@@ -444,28 +453,28 @@ def test_platform_invitation_with_a_webmail_reply_to_is_at_least_medium(monkeypa
 
 
 def test_aligned_dkim_caps_the_weak_signals_but_not_a_bad_first_hop_or_idn():
-    signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
+    signed = {"Authentication-Results": "mx.example.org; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
     links = [{"url": "https://other.example/", "domain": "other.example", "mismatch": True, "shown": "shop.example"}]
-    result = phishing.phishing_score({"From": "Shop <noreply@shop.example>", **signed}, links, "")
+    result = scored({"From": "Shop <noreply@shop.example>", **signed}, links, "")
     assert codes(result) == {"display_mismatch": 5, "link_domain_mismatch": 5}
-    result = phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Received": [LOCALHOST_HOP[1]], **signed}, links, "")
+    result = scored({"From": "Shop <noreply@shop.example>", "Received": [LOCALHOST_HOP[1]], **signed}, links, "")
     assert codes(result) == {"origin_mismatch": 35, "display_mismatch": 10, "link_domain_mismatch": 15}
     idn = [{"url": "https://xn--shp-fma.example/", "domain": "xn--shp-fma.example", "idn": True}]
-    assert codes(phishing.phishing_score({"From": "Shop <noreply@shop.example>", **signed}, idn, ""))["lookalike_domain"] == 30
+    assert codes(scored({"From": "Shop <noreply@shop.example>", **signed}, idn, ""))["lookalike_domain"] == 30
 
 
 def test_reply_to_weight_depends_on_alignment_and_webmail():
-    signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
+    signed = {"Authentication-Results": "mx.example.org; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
     base = {"From": "Shop <noreply@shop.example>"}
-    assert codes(phishing.phishing_score({**base, **signed, "Reply-To": "x@platform.example"}, [], "")) == {"origin_mismatch": 5}
-    assert codes(phishing.phishing_score({**base, "Reply-To": "x@platform.example"}, [], "")) == {"origin_mismatch": 15}
-    assert codes(phishing.phishing_score({**base, "Reply-To": "x@gmail.com"}, [], "")) == {"origin_mismatch": 25}
-    assert codes(phishing.phishing_score({**base, **signed, "Reply-To": "x@laposte.net"}, [], "")) == {"origin_mismatch": 25}
+    assert codes(scored({**base, **signed, "Reply-To": "x@platform.example"}, [], "")) == {"origin_mismatch": 5}
+    assert codes(scored({**base, "Reply-To": "x@platform.example"}, [], "")) == {"origin_mismatch": 15}
+    assert codes(scored({**base, "Reply-To": "x@gmail.com"}, [], "")) == {"origin_mismatch": 25}
+    assert codes(scored({**base, **signed, "Reply-To": "x@laposte.net"}, [], "")) == {"origin_mismatch": 25}
 
 
 def test_lookalike_ignores_generic_words_and_known_sending_domains():
     def lookalike(host, frm):
-        return "lookalike_domain" in codes(phishing.phishing_score({"From": frm}, [{"url": f"https://{host}/", "domain": host}], ""))
+        return "lookalike_domain" in codes(scored({"From": frm}, [{"url": f"https://{host}/", "domain": host}], ""))
     frm = "Lumenco <noreply@lumenco.example>"
     assert not lookalike("lumenco-connect.example", "Connect <noreply@connect.example>")  # the only word is generic
     assert not lookalike("acme.go.link", frm) and not lookalike("lumenco.qualtrics.com", frm) and not lookalike("lumenco.spmta.com", frm)
@@ -479,7 +488,7 @@ def test_crypto_lure_needs_the_vocabulary_and_a_link_off_the_sender_domain():
     own = [{"url": "https://www.coinco.example/", "domain": "www.coinco.example"}]
     frm = {"From": "Coinco <notif@coinco.example>"}
     def crypto(text, links=off, subject=""):
-        return "crypto_transaction_lure" in codes(phishing.phishing_score(frm, links, text, subject))
+        return "crypto_transaction_lure" in codes(scored(frm, links, text, subject))
     assert crypto("Review Transaction & Accept: 0.025 ETH pending in your wallet")
     assert crypto("Votre transaction en attente sur votre portefeuille")
     assert crypto("Never share your seed phrase")
@@ -490,53 +499,53 @@ def test_crypto_lure_needs_the_vocabulary_and_a_link_off_the_sender_domain():
 
 
 def test_authentication_failures_and_spam_verdict():
-    score = phishing.phishing_score(
+    score = scored(
         {"From": "Bank <alerts@bank.example>", "Authentication-Results": "mx.example.org; spf=fail; dkim=fail; dmarc=fail",
          "X-Spam-Flag": "YES", "X-Spam-Score": "9.1"}, [], "")
     assert codes(score) == {"auth_fail": 45, "spam_flag": 30} and score["level"] == "high"
     # only the topmost Authentication-Results counts: a later one is written by the sender
-    forged = phishing.phishing_score({"From": "a@bank.example", "Authentication-Results": ["mx.example.org; spf=pass", "x; spf=fail dmarc=fail"]}, [], "")
+    forged = scored({"From": "a@bank.example", "Authentication-Results": ["mx.example.org; spf=pass", "x; spf=fail dmarc=fail"]}, [], "")
     assert forged["score"] == 0
-    soft = phishing.phishing_score({"From": "a@bank.example", "Received-SPF": "softfail (domain does not designate)"}, [], "")
+    soft = scored({"From": "a@bank.example", "Received-SPF": "softfail (domain does not designate)"}, [], "")
     assert codes(soft) == {"auth_fail": 10}
-    assert phishing.phishing_score({"X-Spam-Bar": "++++++"}, [], "")["reasons"][0]["weight"] == 25
+    assert scored({"X-Spam-Bar": "++++++"}, [], "")["reasons"][0]["weight"] == 25
 
 
 def test_score_is_capped_at_100():
     links = [{"url": "https://bank-secure.example/", "domain": "bank-secure.example", "mismatch": True, "shown": "bank.example", "idn": True}]
-    headers = {"From": "Bank <alerts@bank.example>", "Authentication-Results": "x; spf=fail; dmarc=fail", "X-Spam-Flag": "YES",
+    headers = {"From": "Bank <alerts@bank.example>", "Authentication-Results": "mx.example.org; spf=fail; dmarc=fail", "X-Spam-Flag": "YES",
                "Received": ["from [203.0.113.9] (helo=localhost) by mx"]}
-    result = phishing.phishing_score(headers, links, "Urgent: {{name}}, paiement sous 24 heures")
+    result = scored(headers, links, "Urgent: {{name}}, paiement sous 24 heures")
     assert result["score"] == 100 and sum(r["weight"] for r in result["reasons"]) > 100
 
 
 def test_lookalike_and_alignment_rules():
     def lookalike(host, frm="Mondial Relay <noreply@mondialrelay.fr>"):
         link = {"url": f"https://{host}/", "domain": host}
-        return "lookalike_domain" in codes(phishing.phishing_score({"From": frm}, [link], ""))
+        return "lookalike_domain" in codes(scored({"From": frm}, [link], ""))
     assert lookalike("ml-colis-relay.example") and lookalike("mondialetransporte.example")
     assert lookalike("mondialrelay.fr.verify-colis.example")
     assert not lookalike("www.mondialrelay.fr") and not lookalike("click.mondialrelay.fr") and not lookalike("sendibt3.com")
     assert not lookalike("france-travail.example", "France Connect <noreply@franceconnect.fr>")  # a generic word proves nothing
     assert not lookalike("ml-colis-relay.example", "Camille <camille@gmail.com>")  # not a company address
-    idn = phishing.phishing_score({"From": "a@example.org"}, [{"url": "https://xn--mondilrelay-n6a.example/", "domain": "xn--mondilrelay-n6a.example", "idn": True}], "")
+    idn = scored({"From": "a@example.org"}, [{"url": "https://xn--mondilrelay-n6a.example/", "domain": "xn--mondilrelay-n6a.example", "idn": True}], "")
     assert codes(idn)["lookalike_domain"] == 30
-    aligned = phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Return-Path": "<bounce@mail.shop.example>"}, [], "")
+    aligned = scored({"From": "Shop <noreply@shop.example>", "Return-Path": "<bounce@mail.shop.example>"}, [], "")
     assert aligned["score"] == 0
-    other = phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Return-Path": "<x@elsewhere.example>"}, [], "")
+    other = scored({"From": "Shop <noreply@shop.example>", "Return-Path": "<x@elsewhere.example>"}, [], "")
     assert codes(other) == {"origin_mismatch": 15}
 
 
 def test_first_hop_judges_the_oldest_received_and_only_outside_clients():
     def hop(received, **extra):
-        return codes(phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Received": received, **extra}, [], ""))
+        return codes(scored({"From": "Shop <noreply@shop.example>", "Received": received, **extra}, [], ""))
     assert "origin_mismatch" in hop(["from mx by me", "from [203.0.113.5] by mx with esmtp"])
     assert "origin_mismatch" in hop(["from 203.0.113.5 by mx"])
     assert "origin_mismatch" not in hop(["from localhost (localhost [127.0.0.1]) by mx"])  # internal hand-over
     assert "origin_mismatch" not in hop(["from out.shop.example (out.shop.example [203.0.113.5]) by mx"])
     assert "origin_mismatch" not in hop(["by 2002:a05:6a00 with SMTP id x; Fri"])  # no "from" clause
-    signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
-    assert codes(phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Received": ["from [203.0.113.5] (helo=localhost) by mx"], **signed},
+    signed = {"Authentication-Results": "mx.example.org; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
+    assert codes(scored({"From": "Shop <noreply@shop.example>", "Received": ["from [203.0.113.5] (helo=localhost) by mx"], **signed},
                                          [], ""))["origin_mismatch"] == 35  # a signature does not excuse an improvised first hop
     assert "origin_mismatch" not in hop(["from [203.0.113.5] (helo=localhost) by mx with ESMTPSA"])  # SMTP AUTH: a mail client
     assert "origin_mismatch" not in hop(["from localhost by mx"])  # no public address at all
@@ -544,7 +553,7 @@ def test_first_hop_judges_the_oldest_received_and_only_outside_clients():
 
 def test_placeholders_and_keywords_unit():
     def text_codes(text):
-        return codes(phishing.phishing_score({}, [], text))
+        return codes(scored({}, [], text))
     for text in ("Bonjour {prenom}", "Dear {{ first_name }}", "Hello %FIRSTNAME%", "Hi *|FNAME|*", "Cher [[nom]]"):
         assert text_codes(text) == {"template_placeholder": 20}, text
     for text in ("Bonjour Camille", "function() { return 1 }", "100%off", "a {b} c", "%20%2F"):
@@ -574,11 +583,12 @@ def test_spam_headers_are_returned_and_the_report_is_shortened(monkeypatch):
     headers = security["headers"]
     assert headers["X-Spam-Status"].startswith("No, score=1.2") and len(headers["X-Spam-Report"]) == 300
     assert "X-Spam-Report (text)" in security["capped"]["cut"]
-    assert list(security)[:2] == ["phishing", "headers"]
+    assert list(security)[:3] == ["phishing", "auth", "headers"]
 
 
 def test_score_reads_the_whole_evidence_even_when_output_is_cut(monkeypatch):
-    headers = [("Authentication-Results", "mx.example.org; " + "dkim=pass header.d=a.example; " * 30 + "spf=fail dmarc=fail")]
+    headers = [("Received", "from relay.example.net (relay.example.net [198.51.100.9]) by mx.example.org with ESMTPS; Fri, 21 Nov 2026 08:00:00 +0100"),
+               ("Authentication-Results", "mx.example.org; " + "dkim=pass header.d=a.example; " * 30 + "spf=fail dmarc=fail")]
     result = score_of(monkeypatch, mk(7, "Big", sender="a@bank.example", headers=headers, html="<p>x</p>"), 7)
     assert codes(result)["auth_fail"] == 45 and "spf=fail" in result["reasons"][0]["detail"]  # the failures sit past the 400-character cut
 
@@ -588,7 +598,7 @@ def test_score_is_pure_and_description_still_fits():
     original = socket.socket.connect
     try:
         socket.socket.connect = lambda *a, **k: (_ for _ in ()).throw(AssertionError("network"))
-        assert phishing.phishing_score({"From": "a@example.org"}, [], "x")["level"] == "low"
+        assert scored({"From": "a@example.org"}, [], "x")["level"] == "low"
     finally:
         socket.socket.connect = original
 
@@ -600,6 +610,9 @@ def hop(line):
     return ("Received", line + "; Fri, 21 Nov 2026 08:00:00 +0100")
 
 
+HOSTING = {"server": "host.hosting.example"}   # the receiving server of the fixtures below: the by of their topmost Received
+
+
 OWN_HOP = hop("from host.hosting.example by host.hosting.example with LMTP id ABC123")
 
 SCENARIOS = {
@@ -609,17 +622,16 @@ SCENARIOS = {
         html=('<p>Dana commented on your project.</p>'
               '<a href="https://mandrillapp.com/track/click/30001/app.collabhub.example?p=abc">app.collabhub.example/threads/9</a>'
               '<a href="https://mandrillapp.com/track/unsub/30001/abc">Unsubscribe</a>'),
-        headers=[OWN_HOP, hop("from 198.51.100.45 (unknown [198.51.100.45]) by host.hosting.example with ESMTPS"),
-                 ("Return-Path", "<bounce@mandrillapp.com>"), *aligned_auth("collabhub.example")]),
+        headers=[OWN_HOP, *aligned_auth("collabhub.example", **HOSTING), hop("from 198.51.100.45 (unknown [198.51.100.45]) by host.hosting.example with ESMTPS"),
+                 ("Return-Path", "<bounce@mandrillapp.com>")]),
     # a bank's notification: internal hops on a private address, a container hostname as helo, DKIM aligned
     "bank_internal_hops_aligned": dict(
         sender="Bankco <noreply@bankco.example>", subject="Your transfer was executed", body="Your transfer of 120 euros was executed.",
         html=('<p>Your transfer of 120 euros was executed.</p><a href="https://mabanque.bankco.example/accounts">Open my accounts</a>'
               '<a href="https://mabanque.bankco.example/help">www.bankco.example</a>'),
-        headers=[OWN_HOP,
+        headers=[OWN_HOP, *aligned_auth("bankco.example", **HOSTING),
                  hop("from relay.bankco.example (relay.bankco.example [198.51.100.52]) by host.hosting.example with ESMTPS"),
-                 hop("from 765765b0d442 ([10.225.0.128]) by relay.bankco.example (Postfix) with ESMTP id 4Xyz"),
-                 *aligned_auth("bankco.example")]),
+                 hop("from 765765b0d442 ([10.225.0.128]) by relay.bankco.example (Postfix) with ESMTP id 4Xyz")]),
     # "Amazon" on an unrelated domain, sent from the third party's own machine, a link to an unknown domain
     "fake_amazon_local_send": dict(
         sender="Amazon <service@promo-abo.example>", subject="Merci pour votre abonnement",
@@ -640,6 +652,11 @@ SCENARIOS = {
 }
 
 
+def unsigned_of(headers):
+    """The same headers without the receiver's authentication results and the DKIM signature."""
+    return [h for h in headers if h[0] not in ("Authentication-Results", "DKIM-Signature")]
+
+
 def scenario(monkeypatch, name, **changes):
     spec = {**SCENARIOS[name], **changes}
     return level_of(monkeypatch, spec["sender"], spec["html"], spec["headers"], subject=spec["subject"], body=spec["body"])
@@ -649,7 +666,7 @@ def test_platform_with_a_bare_ip_helo_and_aligned_dkim_stays_low(monkeypatch):
     result = scenario(monkeypatch, "platform_bare_ip_aligned")
     assert result["level"] == "low" and result["score"] < 30
     assert codes(result)["origin_mismatch"] == 5 and "198.51.100.45" in result["reasons"][0]["detail"] + result["reasons"][-1]["detail"]
-    unsigned = scenario(monkeypatch, "platform_bare_ip_aligned", headers=SCENARIOS["platform_bare_ip_aligned"]["headers"][:3])
+    unsigned = scenario(monkeypatch, "platform_bare_ip_aligned", headers=unsigned_of(SCENARIOS["platform_bare_ip_aligned"]["headers"]))
     assert codes(unsigned)["origin_mismatch"] == 15  # the same hop without a DKIM of the From domain
 
 
@@ -657,17 +674,17 @@ def test_bank_notice_through_internal_hops_stays_low(monkeypatch):
     result = scenario(monkeypatch, "bank_internal_hops_aligned")
     assert result["level"] == "low" and "origin_mismatch" not in codes(result)
     assert "display_mismatch" not in codes(result)  # www.bankco.example and mabanque.bankco.example are one site
-    unsigned = scenario(monkeypatch, "bank_internal_hops_aligned", headers=SCENARIOS["bank_internal_hops_aligned"]["headers"][:3])
+    unsigned = scenario(monkeypatch, "bank_internal_hops_aligned", headers=unsigned_of(SCENARIOS["bank_internal_hops_aligned"]["headers"]))
     assert unsigned["level"] in ("low", "medium") and "origin_mismatch" not in codes(unsigned)
 
 
 def test_internal_loopback_relay_of_a_signed_company_is_not_a_local_send(monkeypatch):
-    headers = [OWN_HOP, hop("from relay.bankco.example (relay.bankco.example [198.51.100.52]) by host.hosting.example with ESMTPS"),
-               hop("from localhost (localhost [127.0.0.1]) by relay.bankco.example (Postfix) with ESMTP id 4Xyz"),
-               *aligned_auth("bankco.example")]
+    headers = [OWN_HOP, *aligned_auth("bankco.example", **HOSTING),
+               hop("from relay.bankco.example (relay.bankco.example [198.51.100.52]) by host.hosting.example with ESMTPS"),
+               hop("from localhost (localhost [127.0.0.1]) by relay.bankco.example (Postfix) with ESMTP id 4Xyz")]
     result = level_of(monkeypatch, "Bankco <noreply@bankco.example>", "<p>Statement</p>", headers)
     assert result["level"] == "low" and "origin_mismatch" not in codes(result)
-    unsigned = level_of(monkeypatch, "Bankco <noreply@bankco.example>", "<p>Statement</p>", headers[:3], uid=2)
+    unsigned = level_of(monkeypatch, "Bankco <noreply@bankco.example>", "<p>Statement</p>", unsigned_of(headers), uid=2)
     assert codes(unsigned) == {"origin_mismatch": 25}  # the same hand-over without the company's signature
 
 
@@ -687,7 +704,7 @@ def test_trial_period_notice_from_a_generic_title_is_at_least_medium(monkeypatch
 
 def test_first_external_hop_skips_internal_hops_and_container_helos():
     def origin(*lines, **extra):
-        return codes(phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Received": list(lines), **extra}, [], ""))
+        return codes(scored({"From": "Shop <noreply@shop.example>", "Received": list(lines), **extra}, [], ""))
     own = "from mx.shop.example (mx.shop.example [198.51.100.9]) by host.example"
     for private in ("10.1.2.3", "172.16.5.4", "172.31.255.1", "192.168.0.7", "fd12:3456::1"):
         assert origin(own, f"from relay ([{private}]) by mx.shop.example") == {}, private
@@ -706,9 +723,9 @@ def test_first_external_hop_skips_internal_hops_and_container_helos():
 
 
 def test_bare_ip_and_absent_helo_weigh_15_and_5_with_an_aligned_dkim():
-    signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
+    signed = {"Authentication-Results": "mx.example.org; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
     def origin(line, **extra):
-        return codes(phishing.phishing_score({"From": "Shop <noreply@shop.example>", "Received": [line], **extra}, [], ""))
+        return codes(scored({"From": "Shop <noreply@shop.example>", "Received": [line], **extra}, [], ""))
     for line in ("from 203.0.113.5 by mx", "from [203.0.113.5] (unknown [203.0.113.5]) by mx", "from unknown (unknown [203.0.113.5]) by mx",
                  "from [2001:db8::5] by mx", "from x (helo=[203.0.113.5]) [203.0.113.5] by mx"):
         assert origin(line) == {"origin_mismatch": 15}, line
@@ -722,9 +739,9 @@ def test_bare_ip_and_absent_helo_weigh_15_and_5_with_an_aligned_dkim():
 def test_local_send_needs_a_third_party_server_a_claim_and_no_aligned_dkim():
     chain = ["from mx.shop.example (mx.shop.example [203.0.113.40]) by host.example with esmtps",
              "from localhost by mx.shop.example ([127.0.0.1]) with ESMTP"]
-    signed = {"Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
+    signed = {"Authentication-Results": "mx.example.org; dkim=pass header.d=shop.example; dmarc=pass", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
     def origin(sender, received=chain, **extra):
-        return codes(phishing.phishing_score({"From": sender, "Received": received, **extra}, [], ""))
+        return codes(scored({"From": sender, "Received": received, **extra}, [], ""))
     assert origin("Shop <noreply@shop.example>") == {"origin_mismatch": 25}
     assert origin("Shop <noreply@shop.example>", **signed) == {}                       # the company signed it: its own relay
     assert origin("Camille <camille@perso.example>") == {}                              # a person, no company or brand claimed
@@ -735,8 +752,8 @@ def test_local_send_needs_a_third_party_server_a_claim_and_no_aligned_dkim():
 
 def test_display_name_brand_weights_and_exceptions():
     def named(sender, **extra):
-        return codes(phishing.phishing_score({"From": sender, **extra}, [], "")).get("display_name_brand_mismatch")
-    signed = lambda d: {"Authentication-Results": f"mx; dkim=pass header.d={d}; dmarc=pass", "DKIM-Signature": [{"d": d, "s": "k"}]}
+        return codes(scored({"From": sender, **extra}, [], "")).get("display_name_brand_mismatch")
+    signed = lambda d: {"Authentication-Results": f"mx.example.org; dkim=pass header.d={d}; dmarc=pass", "DKIM-Signature": [{"d": d, "s": "k"}]}
     assert named("Amazon <service@promo-abo.example>") == 30 and named("PayPal Support <help@secure-pay.example>") == 30
     assert named("Mondial Relay <noreply@colis-info.example>") == 30 and named("Crédit Agricole <info@notif-ca.example>") == 30
     assert named("Blockchain <hello@wallet-news.example>") == 30 and named("La Poste <contact@suivi-colis.example>") == 30
@@ -752,7 +769,7 @@ def test_display_name_brand_weights_and_exceptions():
 
 def test_generic_service_title_weighs_15_alone_and_30_next_to_another_signal():
     def named(sender, headers=None, links=(), text=""):
-        return codes(phishing.phishing_score({"From": sender, **(headers or {})}, list(links), text)).get("display_name_brand_mismatch")
+        return codes(scored({"From": sender, **(headers or {})}, list(links), text)).get("display_name_brand_mismatch")
     off = [{"url": "https://clic.offres.example/", "domain": "clic.offres.example"}]
     assert named("Service Client <contact@trial-hub.example>") == 15
     assert named("Support <hello@trial-hub.example>") == 15 and named("Sécurité <alerts@trial-hub.example>") == 15
@@ -760,11 +777,11 @@ def test_generic_service_title_weighs_15_alone_and_30_next_to_another_signal():
     # a link off the From domain or payment wording alone are too common to raise it
     assert named("Service Client <contact@trial-hub.example>", links=off, text="Votre facture, règlement sous 48 heures") == 15
     assert named("Service Client <contact@trial-hub.example>", {"X-Spam-Flag": "YES"}) == 30
-    assert named("Service Client <contact@trial-hub.example>", {"Authentication-Results": "mx; spf=fail"}) == 30
+    assert named("Service Client <contact@trial-hub.example>", {"Authentication-Results": "mx.example.org; spf=fail"}) == 30
     # backed by the address or by the company's own name: not a claim
     assert named("Service Client <service@trial-hub.example>") is None and named("Support <support@trial-hub.example>") is None
     assert named("Trialhub Support <hello@trial-hub.example>") is None
-    assert named("Service Client <contact@trial-hub.example>", {"Authentication-Results": "mx; dkim=pass header.d=trial-hub.example; dmarc=pass",
+    assert named("Service Client <contact@trial-hub.example>", {"Authentication-Results": "mx.example.org; dkim=pass header.d=trial-hub.example; dmarc=pass",
                                                                 "DKIM-Signature": [{"d": "trial-hub.example", "s": "k"}]}) is None
 
 
@@ -773,9 +790,9 @@ def test_redirectors_are_off_domain_links_and_never_trusted():
         assert phishing.redirector(host) and not phishing.on_platform(host), host
     assert phishing.on_platform("www.linkedin.com") and phishing.on_platform("click.mandrillapp.com") and not phishing.redirector("x.com")
     one = [{"url": "https://share.google/abc", "domain": "share.google"}]
-    result = phishing.phishing_score({"From": "Shop <noreply@shop.example>"}, one, "")
+    result = scored({"From": "Shop <noreply@shop.example>"}, one, "")
     assert codes(result) == {"link_domain_mismatch": 15}  # not 5: a shortener is not a known platform
-    crypto = phishing.phishing_score({"From": "Coinco <notif@coinco.example>"}, one, "Never share your seed phrase")
+    crypto = scored({"From": "Coinco <notif@coinco.example>"}, one, "Never share your seed phrase")
     assert "crypto_transaction_lure" in codes(crypto)
 
 
@@ -807,9 +824,9 @@ def test_blockchain_impersonation_scores_high_with_the_brand_signal(monkeypatch)
 # Fictional hosts only (.example / .test, documentation addresses). `dmarc=none` is what a host writes when the From domain
 # publishes no policy: the DKIM signature is still the From domain's own.
 
-def signed_auth(domain, dmarc="none", signer=None):
+def signed_auth(domain, dmarc="none", signer=None, server="mx.example.org"):
     signer = signer or domain
-    return [("Authentication-Results", f"mx.example.org; spf=pass; dkim=pass header.d={signer}; dmarc={dmarc} header.from={domain}"),
+    return [("Authentication-Results", f"{server}; spf=pass; dkim=pass header.d={signer}; dmarc={dmarc} header.from={domain}"),
             ("DKIM-Signature", f"v=1; a=rsa-sha256; d={signer}; s=k1; h=from:to:subject; bh=Zm9v; b=QUFB")]
 
 
@@ -829,7 +846,7 @@ THIRD_PASS = {
     "bank_bounce_service_no_link": dict(
         sender="Finorio <noreply@finorio.example>", subject="Votre relevé est disponible", body="Votre relevé est disponible dans votre espace.",
         html="<p>Votre relevé est disponible dans votre espace.</p>",
-        headers=[*BANK_HOPS, ("Return-Path", "<bounce-77@bounces.worldline.com>"), *signed_auth("finorio.example")]),
+        headers=[BANK_HOPS[0], *signed_auth("finorio.example", **HOSTING), *BANK_HOPS[1:], ("Return-Path", "<bounce-77@bounces.worldline.com>")]),
     # a platform forwards a company's notice under "Brand via Platform": the platform's own signature passes, no link
     "brand_via_platform_no_link": dict(
         sender="EDF via Staffhub <noreply@mail-rh.example>", subject="Votre bulletin est disponible",
@@ -855,6 +872,7 @@ def third(monkeypatch, name, **changes):
 
 
 UNSIGNED = [("Authentication-Results", "mx.example.org; spf=pass; dkim=none; dmarc=none")]
+UNSIGNED_HOSTING = [("Authentication-Results", "host.hosting.example; spf=pass; dkim=none; dmarc=none")]
 
 
 def test_same_brand_under_another_suffix_is_internal_with_an_aligned_dkim(monkeypatch):
@@ -878,36 +896,36 @@ def test_same_brand_rule_unit():
 
 
 def test_same_brand_link_is_internal_only_next_to_an_aligned_dkim_and_a_sane_first_hop():
-    signed = {"Authentication-Results": "mx; dkim=pass header.d=finorio.example; dmarc=pass", "DKIM-Signature": [{"d": "finorio.example", "s": "k"}]}
+    signed = {"Authentication-Results": "mx.example.org; dkim=pass header.d=finorio.example; dmarc=pass", "DKIM-Signature": [{"d": "finorio.example", "s": "k"}]}
     links = [{"url": "https://www.finorio.test/", "domain": "www.finorio.test", "text": "www.finorio.example", "mismatch": True,
               "shown": "www.finorio.example"}]
     base = {"From": "Finorio <noreply@finorio.example>"}
-    assert phishing.phishing_score({**base, **signed}, links, "")["score"] == 0   # not a lookalike, mismatch or display mismatch
-    assert {"lookalike_domain", "link_domain_mismatch", "display_mismatch"} <= set(codes(phishing.phishing_score(base, links, "")))
+    assert scored({**base, **signed}, links, "")["score"] == 0   # not a lookalike, mismatch or display mismatch
+    assert {"lookalike_domain", "link_domain_mismatch", "display_mismatch"} <= set(codes(scored(base, links, "")))
     local = {"Received": [LOCALHOST_HOP[1]]}
     # (the product-site exemption of an aligned DKIM, which holds the whole name, is older and does not look at the first hop)
-    assert {"link_domain_mismatch", "display_mismatch", "origin_mismatch"} <= set(codes(phishing.phishing_score({**base, **signed, **local}, links, "")))
+    assert {"link_domain_mismatch", "display_mismatch", "origin_mismatch"} <= set(codes(scored({**base, **signed, **local}, links, "")))
 
 
 def test_bank_with_a_payment_providers_return_path_and_no_link_stays_low(monkeypatch):
     result = third(monkeypatch, "bank_bounce_service_no_link")
     assert result["level"] == "low" and result["score"] == 0
-    unsigned = third(monkeypatch, "bank_bounce_service_no_link", headers=[*BANK_HOPS, ("Return-Path", "<bounce-77@bounces.worldline.com>"), *UNSIGNED])
+    unsigned = third(monkeypatch, "bank_bounce_service_no_link", headers=[*BANK_HOPS, ("Return-Path", "<bounce-77@bounces.worldline.com>"), *UNSIGNED_HOSTING])
     assert unsigned["level"] == "medium" and codes(unsigned) == {"origin_mismatch": 40}   # 25 local hand-over + 15 Return-Path
 
 
 def test_bounce_services_excuse_the_return_path_only_when_the_dkim_is_aligned_and_the_hop_sane():
-    signed = {"Authentication-Results": "mx; dkim=pass header.d=finorio.example; dmarc=pass", "DKIM-Signature": [{"d": "finorio.example", "s": "k"}]}
+    signed = {"Authentication-Results": "mx.example.org; dkim=pass header.d=finorio.example; dmarc=pass", "DKIM-Signature": [{"d": "finorio.example", "s": "k"}]}
     base = {"From": "Finorio <noreply@finorio.example>"}
     for domain in ("worldline.com", "bounces.worldline.com", "bnc.brevo.com", "em1.sparkpostmail.com", "mandrillapp.com", "amazonses.com",
                    "mg.mailgun.org", "u1.sendgrid.net", "mcsv.net", "rsgsv.net", "bounces.google.com", "googlegroups.com"):
         rp = {"Return-Path": f"<b@{domain}>"}
-        assert codes(phishing.phishing_score({**base, **signed, **rp}, [], "")) == {}, domain
+        assert codes(scored({**base, **signed, **rp}, [], "")) == {}, domain
     rp = {"Return-Path": "<b@bounces.worldline.com>"}
-    assert codes(phishing.phishing_score({**base, **rp}, [], "")) == {"origin_mismatch": 15}                        # not aligned
-    assert codes(phishing.phishing_score({**base, **signed, "Reply-To": "x@bounces.worldline.com"}, [], "")) == {"origin_mismatch": 5}
-    assert codes(phishing.phishing_score({**base, **signed, **rp, "Received": [LOCALHOST_HOP[1]]}, [], ""))["origin_mismatch"] == 40  # 35 + 5
-    assert codes(phishing.phishing_score({**base, **signed, "Return-Path": "<b@elsewhere.example>"}, [], "")) == {"origin_mismatch": 5}
+    assert codes(scored({**base, **rp}, [], "")) == {"origin_mismatch": 15}                        # not aligned
+    assert codes(scored({**base, **signed, "Reply-To": "x@bounces.worldline.com"}, [], "")) == {"origin_mismatch": 5}
+    assert codes(scored({**base, **signed, **rp, "Received": [LOCALHOST_HOP[1]]}, [], ""))["origin_mismatch"] == 40  # 35 + 5
+    assert codes(scored({**base, **signed, "Return-Path": "<b@elsewhere.example>"}, [], "")) == {"origin_mismatch": 5}
 
 
 def test_support_title_through_a_google_group_stays_low(monkeypatch):
@@ -927,18 +945,18 @@ def test_support_title_through_a_google_group_stays_low(monkeypatch):
 def test_group_relay_needs_a_passing_signature_of_the_relay_or_the_from_domain():
     base = {"From": "Support <contact@corp.example>", "List-Id": "<outil.corp.example>", "Return-Path": "<contact+x@googlegroups.com>"}
     def sig(domain, dmarc="pass"):
-        return {"Authentication-Results": f"mx; dkim=pass header.d={domain}; dmarc={dmarc}", "DKIM-Signature": [{"d": domain, "s": "k"}]}
-    assert codes(phishing.phishing_score({**base, **sig("googlegroups.com")}, [], "")) == {}
-    assert codes(phishing.phishing_score({**base, **sig("corp.example")}, [], "")) == {}
-    assert codes(phishing.phishing_score({**base, **sig("random-esp.example")}, [], "")).get("origin_mismatch") == 15   # unrelated signer
-    assert "origin_mismatch" in codes(phishing.phishing_score({**base, **sig("googlegroups.com", dmarc="fail")}, [], ""))
+        return {"Authentication-Results": f"mx.example.org; dkim=pass header.d={domain}; dmarc={dmarc}", "DKIM-Signature": [{"d": domain, "s": "k"}]}
+    assert codes(scored({**base, **sig("googlegroups.com")}, [], "")) == {}
+    assert codes(scored({**base, **sig("corp.example")}, [], "")) == {}
+    assert codes(scored({**base, **sig("random-esp.example")}, [], "")).get("origin_mismatch") == 15   # unrelated signer
+    assert "origin_mismatch" in codes(scored({**base, **sig("googlegroups.com", dmarc="fail")}, [], ""))
     plain = {k: v for k, v in base.items() if k != "List-Id"}
-    assert codes(phishing.phishing_score({**plain, "Return-Path": "<contact@elsewhere.example>", **sig("googlegroups.com")}, [], "")).get("origin_mismatch") == 15
+    assert codes(scored({**plain, "Return-Path": "<contact@elsewhere.example>", **sig("googlegroups.com")}, [], "")).get("origin_mismatch") == 15
     local = {"Received": [LOCALHOST_HOP[1]]}
-    assert "origin_mismatch" in codes(phishing.phishing_score({**base, **sig("googlegroups.com"), **local}, [], ""))
+    assert "origin_mismatch" in codes(scored({**base, **sig("googlegroups.com"), **local}, [], ""))
     # a "Name via Platform" From is a relay too, vouched for by the platform's signature
     via = {"From": "Camille via Staffhub <contact@mail-rh.example>", "Return-Path": "<b@bnc.mail-rh.example>"}
-    assert "origin_mismatch" not in codes(phishing.phishing_score({**via, **sig("staffhub.example")}, [], ""))
+    assert "origin_mismatch" not in codes(scored({**via, **sig("staffhub.example")}, [], ""))
 
 
 def test_brand_through_a_platform_with_no_link_weighs_10_not_30(monkeypatch):
@@ -951,16 +969,16 @@ def test_brand_through_a_platform_with_no_link_weighs_10_not_30(monkeypatch):
     assert codes(stranger) == {"display_name_brand_mismatch": 30} and stranger["level"] == "medium"
     unsigned = third(monkeypatch, "brand_via_platform_no_link", headers=[OK_HOP, *UNSIGNED])
     assert codes(unsigned) == {"display_name_brand_mismatch": 30}
-    assert codes(phishing.phishing_score({"From": "EDF via Staffhub <noreply@mail-rh.example>"}, [], "see https://x.example/a"))["display_name_brand_mismatch"] == 30
+    assert codes(scored({"From": "EDF via Staffhub <noreply@mail-rh.example>"}, [], "see https://x.example/a"))["display_name_brand_mismatch"] == 30
 
 
 def test_generic_title_is_free_when_there_is_no_link_and_a_dkim_passed():
     def named(headers, text="Votre ticket", links=()):
-        return codes(phishing.phishing_score({"From": "Service Client <contact@trial-hub.example>", **headers}, list(links), text)).get("display_name_brand_mismatch")
-    passed = {"Authentication-Results": "mx; dkim=pass header.d=esp.example; dmarc=pass", "DKIM-Signature": [{"d": "esp.example", "s": "k"}]}
+        return codes(scored({"From": "Service Client <contact@trial-hub.example>", **headers}, list(links), text)).get("display_name_brand_mismatch")
+    passed = {"Authentication-Results": "mx.example.org; dkim=pass header.d=esp.example; dmarc=pass", "DKIM-Signature": [{"d": "esp.example", "s": "k"}]}
     assert named({}) == 15 and named(passed) is None
     assert named(passed, links=[{"url": "https://x.example/", "domain": "x.example"}]) == 15 and named(passed, text="Voir https://x.example/a") == 15
-    assert named({"Authentication-Results": "mx; dkim=fail; dmarc=fail"}) == 30
+    assert named({"Authentication-Results": "mx.example.org; dkim=fail; dmarc=fail"}) == 30
     assert named({**passed, "Received": [LOCALHOST_HOP[1]]}) == 30   # an improvised first hop excuses nothing
 
 
@@ -972,7 +990,7 @@ def test_display_mismatch_is_small_for_the_senders_name_on_a_subdomain_or_a_plat
     assert codes(esp)["display_mismatch"] == 5 and esp["level"] == "low"
     unsigned = third(monkeypatch, "bank_tracking_subdomain", headers=[OK_HOP, *UNSIGNED])
     assert codes(unsigned)["display_mismatch"] == 35
-    local = third(monkeypatch, "bank_tracking_subdomain", headers=[LOCALHOST_HOP, *signed_auth("finorio.example")])
+    local = third(monkeypatch, "bank_tracking_subdomain", headers=[LOCALHOST_HOP, *signed_auth("finorio.example", **HOSTING)])
     assert codes(local)["display_mismatch"] == 10 and codes(local)["origin_mismatch"] == 35
 
 
@@ -980,14 +998,14 @@ def test_same_label_on_another_suffix_without_an_aligned_dkim_stays_high(monkeyp
     """The counter-example: a spoofed From, a link to the same name under another suffix, no signature of the From domain."""
     html = ('<p>Action requise: confirmez votre identité sous 24 heures.</p>'
             '<a href="https://mabanque.finorio.test/login">www.finorio.example</a>')
-    headers = [LOCALHOST_HOP, ("Authentication-Results", "mx.example.org; spf=fail smtp.mailfrom=finorio.example; dkim=none; dmarc=fail header.from=finorio.example"),
-               ("Received-SPF", "fail (mx.example.org: domain of finorio.example does not designate 203.0.113.77)")]
+    headers = [LOCALHOST_HOP, ("Authentication-Results", "host.hosting.example; spf=fail smtp.mailfrom=finorio.example; dkim=none; dmarc=fail header.from=finorio.example"),
+               ("Received-SPF", "fail (host.hosting.example: domain of finorio.example does not designate 203.0.113.77)")]
     result = level_of(monkeypatch, "Finorio <noreply@finorio.example>", html, headers, subject="Action requise", body="Action requise: confirmez votre identité")
     assert result["level"] == "high" and {"auth_fail", "origin_mismatch", "lookalike_domain", "link_domain_mismatch"} <= set(codes(result))
     # a signature of an unrelated domain, or the From's own signature with an improvised first hop: not excused either
-    other = level_of(monkeypatch, "Finorio <noreply@finorio.example>", html, [LOCALHOST_HOP, *signed_auth("finorio.example", signer="elsewhere.example")], uid=2)
+    other = level_of(monkeypatch, "Finorio <noreply@finorio.example>", html, [LOCALHOST_HOP, *signed_auth("finorio.example", signer="elsewhere.example", **HOSTING)], uid=2)
     assert other["level"] in ("medium", "high") and {"lookalike_domain", "display_mismatch"} <= set(codes(other))
-    signed_local = level_of(monkeypatch, "Finorio <noreply@finorio.example>", html, [LOCALHOST_HOP, *signed_auth("finorio.example")], uid=3)
+    signed_local = level_of(monkeypatch, "Finorio <noreply@finorio.example>", html, [LOCALHOST_HOP, *signed_auth("finorio.example", **HOSTING)], uid=3)
     assert signed_local["level"] in ("medium", "high") and {"origin_mismatch", "link_domain_mismatch", "display_mismatch"} <= set(codes(signed_local))
     # no alignment at all and nothing else wrong: still a look-alike of the brand, and the displayed name still lies
     quiet = level_of(monkeypatch, "Finorio <noreply@finorio.example>", html, [OK_HOP, *UNSIGNED], uid=4)
@@ -998,8 +1016,197 @@ def test_alignment_survives_a_dmarc_result_that_is_not_a_failure():
     base = {"From": "Shop <noreply@shop.example>", "Return-Path": "<x@elsewhere.example>", "DKIM-Signature": [{"d": "shop.example", "s": "k"}]}
     for dmarc, expected in (("pass", {"origin_mismatch": 5}), ("none", {"origin_mismatch": 5}), ("bestguesspass", {"origin_mismatch": 5}),
                             ("fail", {"auth_fail": 35, "origin_mismatch": 15})):
-        headers = {**base, "Authentication-Results": f"mx; dkim=pass header.d=shop.example; dmarc={dmarc}"}
-        assert codes(phishing.phishing_score(headers, [], "")) == expected, dmarc
+        headers = {**base, "Authentication-Results": f"mx.example.org; dkim=pass header.d=shop.example; dmarc={dmarc}"}
+        assert codes(scored(headers, [], "")) == expected, dmarc
     no_signature = {"From": "Shop <noreply@shop.example>", "Return-Path": "<x@elsewhere.example>",
-                    "Authentication-Results": "mx; dkim=pass header.d=shop.example; dmarc=pass"}   # header.d of the result is enough
-    assert codes(phishing.phishing_score(no_signature, [], "")) == {"origin_mismatch": 5}
+                    "Authentication-Results": "mx.example.org; dkim=pass header.d=shop.example; dmarc=pass"}   # header.d of the result is enough
+    assert codes(scored(no_signature, [], "")) == {"origin_mismatch": 5}
+
+
+# --- Only the receiving server's authentication results count ---
+# The sender writes every header it sends: an `Authentication-Results: x; dkim=pass header.d=<bank>` that it added itself
+# says nothing. Fictional hosts only; the receiving server of these fixtures is host.hosting.example, which (like a shared
+# Exim / cPanel host) writes no Authentication-Results of its own.
+
+RECEIVER = ("Received", "from out.sender-hub.example (out.sender-hub.example [198.51.100.30]) by host.hosting.example "
+                         "with esmtps (Exim 4.100.1) id 1vMabc-000xyz-1Q; Fri, 21 Nov 2026 08:00:02 +0100")
+SENDER_HOP = ("Received", "from [203.0.113.64] (unknown [203.0.113.64]) by out.sender-hub.example with ESMTP; "
+                          "Fri, 21 Nov 2026 08:00:00 +0100")
+BANK_HTML = ('<p>Votre espace est suspendu. Confirmez votre identité.</p>'
+             '<a href="https://finorio-secure.example/login?id=3">www.finorio.example</a>'
+             '<a href="https://tracker.mail-hub.example/u/9">Confirmer</a>')
+FORGED_PASS = "dkim=pass header.d=finorio.example; spf=pass smtp.mailfrom=finorio.example; dmarc=pass header.from=finorio.example"
+FINORIO_SIGNATURE = ("DKIM-Signature", "v=1; a=rsa-sha256; d=finorio.example; s=k1; h=from:to:subject; bh=Zm9v; b=QUFB")
+
+
+def forged(monkeypatch, headers, uid=1):
+    return level_of(monkeypatch, "Finorio <noreply@finorio.example>", BANK_HTML, headers, subject="Action requise",
+                    body="Votre espace est suspendu. Confirmez votre identité.", uid=uid)
+
+
+def test_an_authentication_results_with_another_authserv_id_is_the_senders_and_attenuates_nothing(monkeypatch):
+    result = forged(monkeypatch, [RECEIVER, SENDER_HOP, ("Authentication-Results", f"x.attacker.example; {FORGED_PASS}"), FINORIO_SIGNATURE])
+    assert result["level"] == "high" and {"lookalike_domain", "link_domain_mismatch", "display_mismatch"} <= set(codes(result))
+    assert codes(result)["lookalike_domain"] == 35 and codes(result)["display_mismatch"] == 35   # not capped at 5
+    security = server.read_message("INBOX", 1, security=True)["security"]
+    assert security["auth"] == "unknown"   # the report says that no result was the receiver's
+    # the same mail without the forged line scores the same: it is simply ignored
+    plain = forged(monkeypatch, [RECEIVER, SENDER_HOP, FINORIO_SIGNATURE], uid=2)
+    assert plain["score"] == result["score"] and codes(plain) == codes(result)
+
+
+def test_an_authentication_results_under_an_external_received_line_is_the_senders(monkeypatch):
+    # the authserv-id is the receiving server's, as an attacker would write it, but the line sits below a Received
+    # line that another server wrote: the receiver's own results are written above everything it received
+    headers = [RECEIVER, SENDER_HOP, ("Authentication-Results", f"host.hosting.example; {FORGED_PASS}"), FINORIO_SIGNATURE]
+    result = forged(monkeypatch, headers)
+    assert result["level"] == "high" and codes(result)["lookalike_domain"] == 35
+    assert server.read_message("INBOX", 1, security=True)["security"]["auth"] == "unknown"
+    # above that line the same text is the receiver's
+    result = forged(monkeypatch, [RECEIVER, ("Authentication-Results", f"host.hosting.example; {FORGED_PASS}"), SENDER_HOP, FINORIO_SIGNATURE], uid=2)
+    assert result["level"] == "low" and server.read_message("INBOX", 2, security=True)["security"]["auth"] == "receiver"
+
+
+def test_a_forged_failure_from_the_sender_is_ignored_too(monkeypatch):
+    headers = [RECEIVER, SENDER_HOP, ("Authentication-Results", "x; spf=fail; dmarc=fail"), ("Received-SPF", "fail (x: no)")]
+    assert "auth_fail" not in codes(forged(monkeypatch, headers))
+
+
+def test_a_dkim_signature_claiming_the_banks_domain_does_not_align_it(monkeypatch):
+    # the trusted result vouches for the attacker's own signature; a second, unchecked one claims d=<bank>
+    attacker = ("DKIM-Signature", "v=1; a=rsa-sha256; d=phish-sender.example; s=sel2026; h=from:to; bh=Zm9v; b=QUFB")
+    headers = [RECEIVER, ("Authentication-Results", "host.hosting.example; dkim=pass header.d=phish-sender.example; "
+                          "dmarc=none header.from=finorio.example"), SENDER_HOP, attacker, FINORIO_SIGNATURE]
+    result = forged(monkeypatch, headers)
+    assert result["level"] == "high" and codes(result)["lookalike_domain"] == 35 and codes(result)["display_mismatch"] == 35
+    assert server.read_message("INBOX", 1, security=True)["security"]["auth"] == "receiver"
+    evidence = {"DKIM-Signature": [{"d": "phish-sender.example", "s": "sel2026"}, {"d": "finorio.example", "s": "k1"}]}
+    trust = {"ar": "host.hosting.example; dkim=pass header.d=phish-sender.example", "spf": ""}
+    assert phishing._dkim_pass_domains(evidence, trust) == {"phish-sender.example"}
+
+
+def test_a_trusted_dkim_pass_names_its_domain_by_header_d_then_header_i():
+    def domains(ar, signatures=()):
+        sigs = {"DKIM-Signature": [{"d": d, "s": "k"} for d in signatures]}
+        return phishing._dkim_pass_domains(sigs, {"ar": ar, "spf": ""})
+    signed = ["finorio.example", "phish-sender.example"]
+    assert domains("mx.example.org; dkim=pass header.d=mail.finorio.example header.s=k", signed) == {"finorio.example"}
+    assert domains("mx.example.org; dkim=pass header.i=@news.finorio.example header.s=k", signed) == {"finorio.example"}
+    assert domains("mx.example.org; dkim=pass header.i=bounce@finorio.example", signed) == {"finorio.example"}
+    assert domains("mx.example.org; dkim=pass header.d=a.example; dkim=pass header.d=b.example", signed) == {"a.example", "b.example"}
+    assert domains("mx.example.org; dkim=fail header.d=finorio.example; dkim=pass header.d=a.example") == {"a.example"}
+    assert domains("mx.example.org; dkim=pass header.d=finorio.example; dmarc=fail", signed) == set()
+    assert domains("mx.example.org; dkim=none; spf=pass", signed) == set()
+
+
+def test_a_dkim_pass_without_header_d_or_i_aligns_only_a_message_with_one_signature():
+    def domains(*signatures):
+        sigs = {"DKIM-Signature": [{"d": d, "s": "k"} for d in signatures]}
+        return phishing._dkim_pass_domains(sigs, {"ar": "mx.example.org; dkim=pass (good signature)", "spf": ""})
+    assert domains("finorio.example") == {"finorio.example"}
+    assert domains("finorio.example", "phish-sender.example") == set()   # which one passed? nothing says: no alignment
+    assert domains() == set()
+    assert domains("") == set()   # a signature without d= names nothing
+
+
+def test_receiving_server_is_the_by_of_the_topmost_received_or_a_configured_authserv_id():
+    top = "from a.example ([198.51.100.1]) by mx.example.org with ESMTPS"
+    old = "from b.example ([198.51.100.2]) by a.example with ESMTP"
+    ar = "mx.example.org; dkim=pass header.d=finorio.example"
+    headers = {"Received": [top, old], "Authentication-Results": [ar], "_Order": ["received", "authentication-results", "received"]}
+    assert phishing.trusted_results(headers)["ar"] == ar
+    assert phishing.trusted_results({**headers, "_Order": ["received", "received", "authentication-results"]})["ar"] == ""  # below `old`
+    assert phishing.trusted_results({**headers, "Authentication-Results": ["mx.attacker.example; dkim=pass"]})["ar"] == ""
+    assert phishing.trusted_results({**headers, "Authentication-Results": ["in.example.org; dkim=pass"]})["ar"] != ""   # same organisation
+    assert phishing.trusted_results({**headers, "Authentication-Results": ["MX.EXAMPLE.ORG.; dkim=pass"]})["ar"] != ""   # case and dot
+    assert phishing.trusted_results({**headers, "Authentication-Results": ["mx.example.org 1; dkim=pass"]})["ar"] != ""  # with a version
+    assert phishing.trusted_results({**headers, "_Order": None})["ar"] == ""    # no positions: cannot tell
+    # the topmost line that qualifies wins; a lower one (the sender's) never does
+    both = {**headers, "Authentication-Results": ["mx.example.org; spf=pass", "mx.example.org; spf=fail"],
+            "_Order": ["received", "authentication-results", "authentication-results", "received"]}
+    assert phishing.trusted_results(both)["ar"] == "mx.example.org; spf=pass"
+    # Gmail: the topmost line only names an internal token, so the configured server is the receiver
+    gmail = {"Received": ["by 2002:a05:6a10:1 with SMTP id x; Fri", "from mail.finorio.example (mail.finorio.example. [198.51.100.60]) by mx.google.com with ESMTPS id 1",
+                          "from [10.0.0.5] by mail.finorio.example; Fri"],
+             "Authentication-Results": ["mx.google.com; dkim=pass header.i=@finorio.example header.s=k1"],
+             "_Order": ["received", "received", "authentication-results", "received"]}
+    assert phishing.trusted_results(gmail)["ar"] == ""
+    assert phishing.trusted_results(gmail, ("mx.google.com",))["ar"] == gmail["Authentication-Results"][0]
+    low = {**gmail, "_Order": ["received", "received", "received", "authentication-results"]}   # under the sender's own line
+    assert phishing.trusted_results(low, ("mx.google.com",))["ar"] == ""
+    # an IP, an IPv6 token or a bare word is not a host: an authserv-id never matches it
+    assert phishing.trusted_results({"Received": ["from x by 192.0.2.1"], "Authentication-Results": ["192.0.2.1; dkim=pass"],
+                                     "_Order": ["received", "authentication-results"]})["ar"] == ""
+
+
+def test_received_spf_counts_only_when_the_receiver_added_it_above_the_first_external_line():
+    top = "from a.example ([198.51.100.1]) by mx.example.org with ESMTPS"
+    old = "from b.example ([198.51.100.2]) by a.example with ESMTP"
+    spf = "fail (mx.example.org: domain of finorio.example does not designate 198.51.100.1 as permitted sender)"
+    base = {"Received": [top, old], "Received-SPF": [spf]}
+    assert phishing.trusted_results({**base, "_Order": ["received", "received-spf", "received"]})["spf"] == spf
+    assert phishing.trusted_results({**base, "_Order": ["received", "received", "received-spf"]})["spf"] == ""
+    forged_host = "pass (mx.attacker.example: domain of finorio.example designates 198.51.100.1 as permitted sender)"
+    assert phishing.trusted_results({**base, "Received-SPF": [forged_host], "_Order": ["received", "received-spf", "received"]})["spf"] == ""
+    bare = "pass"
+    assert phishing.trusted_results({**base, "Received-SPF": [bare], "_Order": ["received", "received-spf", "received"]})["spf"] == bare
+    # Gmail's own comment names google.com, the organisation of mx.google.com
+    google = "pass (google.com: domain of a@finorio.example designates 198.51.100.1 as permitted sender)"
+    assert phishing.trusted_results({"Received": ["by 2002:a05::1 with SMTP id x", "from m.example by mx.google.com with ESMTPS"],
+                                     "Received-SPF": [google], "_Order": ["received", "received", "received-spf"]},
+                                    ("mx.google.com",))["spf"] == google
+
+
+def test_arc_authentication_results_is_never_trusted():
+    headers = {"Received": ["from a.example ([198.51.100.1]) by mx.example.org with ESMTPS"],
+               "ARC-Authentication-Results": ["i=1; mx.example.org; dkim=pass header.d=finorio.example; dmarc=pass"],
+               "_Order": ["received"]}
+    assert phishing.trusted_results(headers) == {"ar": "", "spf": ""} and phishing._authentication(phishing.trusted_results(headers)) == {}
+
+
+def test_without_a_trusted_result_the_authentication_is_unknown_not_pass_and_not_fail(monkeypatch):
+    # no Authentication-Results at all (a host that writes none) and a Received-SPF the sender wrote
+    headers = [RECEIVER, SENDER_HOP, ("Received-SPF", "fail (x: forged)"), FINORIO_SIGNATURE]
+    result = forged(monkeypatch, headers)
+    assert "auth_fail" not in codes(result) and codes(result)["lookalike_domain"] == 35
+    assert server.read_message("INBOX", 1, security=True)["security"]["auth"] == "unknown"
+
+
+def test_the_receivers_failures_still_count(monkeypatch):
+    headers = [RECEIVER, ("Authentication-Results", "host.hosting.example; spf=fail smtp.mailfrom=finorio.example; dmarc=fail header.from=finorio.example"),
+               SENDER_HOP]
+    assert codes(forged(monkeypatch, headers))["auth_fail"] == 45
+
+
+def test_a_configured_authserv_id_makes_the_account_trust_that_server(monkeypatch):
+    monkeypatch.setenv("MAIL_AUTH_SERVERS", "gate.example.net")
+    headers = [RECEIVER, ("Authentication-Results", f"gate.example.net; {FORGED_PASS}"), SENDER_HOP, FINORIO_SIGNATURE]
+    assert forged(monkeypatch, headers)["level"] == "low"
+    monkeypatch.delenv("MAIL_AUTH_SERVERS")
+    assert forged(monkeypatch, headers, uid=2)["level"] == "high"   # not the receiver, not configured
+
+
+def test_the_trusted_servers_of_an_account_reach_the_report(monkeypatch):
+    seen = {}
+    real = phishing.phishing_score
+
+    def spy(headers, links, body, subject="", trusted_servers=()):
+        seen["servers"] = trusted_servers
+        return real(headers, links, body, subject, trusted_servers)
+    monkeypatch.setattr(phishing, "phishing_score", spy)
+    monkeypatch.setenv("MAIL_AUTH_SERVERS", "gate.example.net")
+    install(monkeypatch, FakeIMAP({"INBOX": {"flags": "", "messages": [mk(1, "Hi", html="<p>x</p>")]}}))
+    server.read_message("INBOX", 1, security=True)
+    assert seen["servers"] == ("gate.example.net",)
+    monkeypatch.delenv("MAIL_AUTH_SERVERS")
+    server.read_message("INBOX", 1, security=True)
+    assert seen["servers"] == ()
+
+
+def test_raw_headers_records_where_the_results_sit_relative_to_the_received_lines():
+    raw = mk(1, "Hi", headers=[RECEIVER, ("Authentication-Results", "host.hosting.example; dkim=none"), SENDER_HOP,
+                               ("Received-SPF", "none"), ("X-Other", "1")])["raw"]
+    evidence = phishing.raw_headers(email.message_from_bytes(raw, policy=policy.default))
+    assert evidence["_Order"] == ["received", "authentication-results", "received", "received-spf"]
+    msg = email.message_from_bytes(raw, policy=policy.default)
+    assert "_Order" not in phishing.auth_headers(msg, evidence)[0]   # internal: never returned to the model

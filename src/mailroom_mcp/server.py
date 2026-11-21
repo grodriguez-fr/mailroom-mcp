@@ -2291,19 +2291,22 @@ def fetch_text(M, uid: int, part, folder: str, hint: str, warnings: list) -> str
     return decode_part(raw, part)
 
 
-def security_report(msg, markup: str | None, body: str, warnings: list) -> dict:
+def security_report(msg, markup: str | None, body: str, warnings: list, auth_servers: tuple[str, ...] = ()) -> dict:
     """read_message(security=true): authentication headers, link targets and a phishing suspicion score (computed on
     the whole evidence, before any cut). What does not fit the size budget is dropped by priority (phishing block,
     authentication headers, identity headers, flagged links, Received lines, other links, spam report) and named in
-    `capped`."""
+    `capped`. `auth_servers`: the authserv-ids of the account's receiving server; an Authentication-Results written by
+    anyone else is the sender's and is ignored (`security.auth` says whether a trusted one was found)."""
     full = phishing.raw_headers(msg)
     headers, cut = phishing.auth_headers(msg, full)
     signatures = phishing.dkim_signatures(msg)  # {d, s} only: the score needs the signing domain to tell an aligned DKIM
     evidence = {**full, "DKIM-Signature": signatures} if signatures else full
-    links, flagged = phishing.order_links(evidence, phishing.extract_links(markup)) if markup is not None else ([], 0)
-    score = phishing.phishing_score(evidence, links, body, (phishing.header_values(msg, "Subject") or [""])[0])
+    links, flagged = phishing.order_links(evidence, phishing.extract_links(markup), auth_servers) if markup is not None else ([], 0)
+    score = phishing.phishing_score(evidence, links, body, (phishing.header_values(msg, "Subject") or [""])[0],
+                                   auth_servers)
     headers, links, dropped = phishing.trim_evidence(score, headers, links, flagged, SECURITY_BUDGET)
-    report = {"phishing": score, "headers": headers, "links": links}
+    report = {"phishing": score, "auth": "receiver" if any(phishing.trusted_results(evidence, auth_servers).values()) else "unknown",
+              "headers": headers, "links": links}
     if markup is None:
         warnings.append("No HTML part: no link targets to check (a plain text link is not listed).")
     cut += dropped
@@ -2393,7 +2396,7 @@ def read_message(
     if inline:
         out["inline_images"] = inline
     if security:
-        out["security"] = security_report(msg, markup, body, warnings)
+        out["security"] = security_report(msg, markup, body, warnings, acct.trusted_auth_servers)
     if late:
         warnings.append(late)
     if warnings:
